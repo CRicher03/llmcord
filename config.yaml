@@ -59,16 +59,16 @@ providers:
     base_url: http://localhost:8000/v1
 
 models:
-  openai/gpt-5.5:
+  openrouter/openai/gpt-5.5:web_search
     reasoning_effort: high
     verbosity: medium
 
-  openrouter/~anthropic/claude-opus-latest:
+  openrouter/~anthropic/claude-opus-latest:web_search
     tools:
       - type: openrouter:web_search
       - type: openrouter:web_fetch
 
-  ollama/llama4:
+  openrouter/x-ai/grok-4.20:web_search
 
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.

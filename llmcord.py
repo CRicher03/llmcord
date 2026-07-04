@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import os
+import json
 from typing import Any, Literal, Optional
 
 import discord
@@ -33,9 +34,28 @@ EDIT_DELAY_SECONDS = 1
 MAX_MESSAGE_NODES = 500
 
 
+def parse_env_value(value: Optional[str]) -> Any:
+    if value is None:
+        return None
+
+    stripped = value.strip()
+
+    # Allow Render env vars like ADMIN_IDS=[123,456] or ADMIN_IDS=123,456
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    if "," in stripped:
+        parts = [part.strip() for part in stripped.split(",") if part.strip()]
+        return [int(part) if part.isdigit() else part for part in parts]
+
+    return int(stripped) if stripped.isdigit() else value
+
+
 def resolve_env(node: Any) -> Any:
     if isinstance(node, dict):
-        return {key.removesuffix("_env"): os.environ.get(value) if key.endswith("_env") else resolve_env(value) for key, value in node.items()}
+        return {key.removesuffix("_env"): parse_env_value(os.environ.get(value)) if key.endswith("_env") else resolve_env(value) for key, value in node.items()}
     return node
 
 
@@ -73,6 +93,108 @@ class MsgNode:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+
+def interaction_is_private(interaction: discord.Interaction) -> bool:
+    return interaction.channel is None or getattr(interaction.channel, "type", None) == discord.ChannelType.private
+
+
+def is_admin_user(user_id: int, loaded_config: dict[str, Any]) -> bool:
+    admin_ids = loaded_config.get("permissions", {}).get("users", {}).get("admin_ids", []) or []
+    if isinstance(admin_ids, int):
+        admin_ids = [admin_ids]
+    return user_id in {int(admin_id) for admin_id in admin_ids}
+
+
+def user_has_permission_for_interaction(interaction: discord.Interaction, loaded_config: dict[str, Any]) -> bool:
+    permissions = loaded_config["permissions"]
+    user_id = interaction.user.id
+
+    if is_admin_user(user_id, loaded_config):
+        return True
+
+    allowed_user_ids = permissions["users"].get("allowed_ids", []) or []
+    blocked_user_ids = permissions["users"].get("blocked_ids", []) or []
+    allowed_role_ids = permissions["roles"].get("allowed_ids", []) or []
+    blocked_role_ids = permissions["roles"].get("blocked_ids", []) or []
+    allowed_channel_ids = permissions["channels"].get("allowed_ids", []) or []
+    blocked_channel_ids = permissions["channels"].get("blocked_ids", []) or []
+
+    role_ids = {role.id for role in getattr(interaction.user, "roles", ())}
+    channel = interaction.channel
+    channel_ids = set(filter(None, (
+        getattr(channel, "id", None),
+        getattr(channel, "parent_id", None),
+        getattr(channel, "category_id", None),
+    )))
+
+    is_dm_or_group = interaction.guild is None
+    allow_dms = loaded_config.get("allow_dms", True)
+
+    allow_all_users = not allowed_user_ids if is_dm_or_group else not allowed_user_ids and not allowed_role_ids
+    is_good_user = allow_all_users or user_id in allowed_user_ids or any(role_id in allowed_role_ids for role_id in role_ids)
+    is_bad_user = not is_good_user or user_id in blocked_user_ids or any(role_id in blocked_role_ids for role_id in role_ids)
+
+    allow_all_channels = not allowed_channel_ids
+    is_good_channel = allow_dms if is_dm_or_group else allow_all_channels or any(channel_id in allowed_channel_ids for channel_id in channel_ids)
+    is_bad_channel = not is_good_channel or any(channel_id in blocked_channel_ids for channel_id in channel_ids)
+
+    return not is_bad_user and not is_bad_channel
+
+
+def build_openai_client_and_kwargs(loaded_config: dict[str, Any], provider_slash_model: str, messages: list[dict[str, Any]], stream: bool) -> dict[str, Any]:
+    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
+
+    provider_config = loaded_config["providers"][provider]
+    base_url = provider_config["base_url"]
+    api_key = provider_config.get("api_key", "sk-no-key-required")
+    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+    model_parameters = loaded_config["models"].get(provider_slash_model, None)
+    extra_headers = provider_config.get("extra_headers")
+    extra_query = provider_config.get("extra_query")
+    extra_body = (provider_config.get("extra_body") or {}) | (model_parameters or {}) or None
+
+    return dict(
+        client=openai_client,
+        kwargs=dict(
+            model=model,
+            messages=messages,
+            stream=stream,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+            extra_body=extra_body,
+        ),
+    )
+
+
+def append_system_prompt(messages: list[dict[str, Any]], loaded_config: dict[str, Any]) -> None:
+    if system_prompt := loaded_config.get("system_prompt"):
+        now = datetime.now().astimezone()
+        system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
+        messages.append(dict(role="system", content=system_prompt))
+
+
+async def generate_nonstream_response(prompt: str, user_id: int, loaded_config: dict[str, Any]) -> str:
+    messages = [dict(role="user", content=f"<@{user_id}>: {prompt[:loaded_config.get('max_text', 100000)]}")]
+    append_system_prompt(messages, loaded_config)
+
+    client_and_kwargs = build_openai_client_and_kwargs(loaded_config, curr_model, messages[::-1], stream=False)
+    response = await client_and_kwargs["client"].chat.completions.create(**client_and_kwargs["kwargs"])
+    return response.choices[0].message.content or ""
+
+
+async def send_interaction_chunks(interaction: discord.Interaction, content: str, private: bool) -> None:
+    max_len = 1900
+    chunks = [content[i:i + max_len] for i in range(0, len(content), max_len)] or ["*(empty response)*"]
+    for index, chunk in enumerate(chunks):
+        if index == 0:
+            await interaction.followup.send(chunk, ephemeral=private)
+        else:
+            await interaction.followup.send(chunk, ephemeral=private)
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @discord_bot.tree.command(name="model", description="View or switch the current model")
 async def model_command(interaction: discord.Interaction, model: str) -> None:
     global curr_model
@@ -80,14 +202,14 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
     if model == curr_model:
         output = f"Current model: `{curr_model}`"
     else:
-        if user_is_admin := interaction.user.id in config["permissions"]["users"]["admin_ids"]:
+        if user_is_admin := is_admin_user(interaction.user.id, config):
             curr_model = model
             output = f"Model switched to: `{model}`"
             logging.info(output)
         else:
             output = "You don't have permission to change the model."
 
-    await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
+    await interaction.response.send_message(output, ephemeral=interaction_is_private(interaction))
 
 
 @model_command.autocomplete("model")
@@ -103,10 +225,40 @@ async def model_autocomplete(interaction: discord.Interaction, curr_str: str) ->
     return choices[:25]
 
 
+
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@discord.app_commands.describe(prompt="What you want the bot to answer", private="Only show the response to you")
+@discord_bot.tree.command(name="ask", description="Ask the current model a question")
+async def ask_command(interaction: discord.Interaction, prompt: str, private: bool = False) -> None:
+    global config
+
+    config = await asyncio.to_thread(get_config)
+
+    if not user_has_permission_for_interaction(interaction, config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=private)
+
+    try:
+        output = await generate_nonstream_response(prompt, interaction.user.id, config)
+        await send_interaction_chunks(interaction, output, private)
+        logging.info(f"/ask completed (user ID: {interaction.user.id}, model: {curr_model})")
+    except Exception:
+        logging.exception("Error while generating /ask response")
+        await interaction.followup.send("Something went wrong while generating the response. Check the Render logs.", ephemeral=True)
+
+
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config.get("client_id"):
-        logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot\n")
+        logging.info(
+            f"\n\nBOT SERVER INSTALL URL:\n"
+            f"https://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot%20applications.commands\n\n"
+            f"USER INSTALL URL FOR /ask IN DMS AND GROUP DMS:\n"
+            f"https://discord.com/oauth2/authorize?client_id={client_id}&scope=applications.commands&integration_type=1\n"
+        )
 
     await discord_bot.tree.sync()
 
@@ -129,7 +281,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
     permissions = config["permissions"]
 
-    user_is_admin = new_msg.author.id in permissions["users"]["admin_ids"]
+    user_is_admin = is_admin_user(new_msg.author.id, config)
 
     (allowed_user_ids, blocked_user_ids), (allowed_role_ids, blocked_role_ids), (allowed_channel_ids, blocked_channel_ids) = (
         (perm["allowed_ids"], perm["blocked_ids"]) for perm in (permissions["users"], permissions["roles"], permissions["channels"])

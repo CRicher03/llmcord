@@ -59,16 +59,162 @@ providers:
     base_url: http://localhost:8000/v1
 
 models:
-  openrouter/openai/gpt-5.5:web_search
-    reasoning_effort: high
-    verbosity: medium
+  # -------------------------
+  # OpenRouter routers
+  # -------------------------
 
-  openrouter/~anthropic/claude-opus-latest:web_search
-    tools:
-      - type: openrouter:web_search
-      - type: openrouter:web_fetch
+  openrouter/openrouter/auto:
+    temperature: 0.7
 
-  openrouter/x-ai/grok-4.20:web_search
+  openrouter/openrouter/free:
+    temperature: 0.7
+
+  openrouter/openrouter/fusion:
+    temperature: 0.7
+
+
+  # -------------------------
+  # Latest aliases
+  # These auto-update on OpenRouter
+  # -------------------------
+
+  openrouter/~openai/gpt-latest:
+    temperature: 0.7
+
+  openrouter/~openai/gpt-mini-latest:
+    temperature: 0.7
+
+  openrouter/~anthropic/claude-sonnet-latest:
+    temperature: 0.7
+
+  openrouter/~anthropic/claude-haiku-latest:
+    temperature: 0.7
+
+  openrouter/~anthropic/claude-fable-latest:
+    temperature: 0.7
+
+  openrouter/~google/gemini-pro-latest:
+    temperature: 0.7
+
+  openrouter/~google/gemini-flash-latest:
+    temperature: 0.7
+
+  openrouter/~moonshotai/kimi-latest:
+    temperature: 0.7
+
+
+  # -------------------------
+  # Top flagship models
+  # -------------------------
+
+  openrouter/openai/gpt-5.5:
+    temperature: 0.7
+
+  openrouter/anthropic/claude-sonnet-5:
+    temperature: 0.7
+
+  openrouter/anthropic/claude-fable-5:
+    temperature: 0.7
+
+  openrouter/anthropic/claude-opus-4.8:
+    temperature: 0.7
+
+  openrouter/google/gemini-3.5-flash:
+    temperature: 0.7
+
+  openrouter/x-ai/grok-4.20:
+    temperature: 0.7
+
+  openrouter/x-ai/grok-4.20-multi-agent:
+    temperature: 0.7
+
+  openrouter/x-ai/grok-4.3:
+    temperature: 0.7
+
+
+  # -------------------------
+  # Strong coding / reasoning models
+  # -------------------------
+
+  openrouter/deepseek/deepseek-v4-pro:
+    temperature: 0.7
+
+  openrouter/deepseek/deepseek-v4-flash:
+    temperature: 0.7
+
+  openrouter/deepseek/deepseek-v3.2:
+    temperature: 0.7
+
+  openrouter/qwen/qwen3.7-max:
+    temperature: 0.7
+
+  openrouter/qwen/qwen3.7-plus:
+    temperature: 0.7
+
+  openrouter/z-ai/glm-5.2:
+    temperature: 0.7
+
+  openrouter/moonshotai/kimi-k2.7-code:
+    temperature: 0.7
+
+  openrouter/sakana/fugu-ultra:
+    temperature: 0.7
+
+  openrouter/nousresearch/hermes-4-405b:
+    temperature: 0.7
+
+
+  # -------------------------
+  # Good cheap / free options
+  # -------------------------
+
+  openrouter/nvidia/nemotron-3-ultra-550b-a55b:
+    temperature: 0.7
+
+  openrouter/nvidia/nemotron-3-ultra-550b-a55b:free:
+    temperature: 0.7
+
+  openrouter/poolside/laguna-xs-2.1:
+    temperature: 0.7
+
+  openrouter/poolside/laguna-xs-2.1:free:
+    temperature: 0.7
+
+  openrouter/cohere/north-mini-code:free:
+    temperature: 0.7
+
+  openrouter/meta-llama/llama-3.3-70b-instruct:free:
+    temperature: 0.7
+
+
+  # -------------------------
+  # Edgier / less-filtered / roleplay / creative-writing models
+  # Good for chaotic Discord use, character chat, stories, jokes, banter
+  # -------------------------
+
+  openrouter/thedrummer/cydonia-24b-v4.1:
+    temperature: 0.9
+
+  openrouter/cognitivecomputations/dolphin-mistral-24b-venice-edition:free:
+    temperature: 0.9
+
+  openrouter/sao10k/l3.3-euryale-70b:
+    temperature: 0.9
+
+  openrouter/gryphe/mythomax-l2-13b:
+    temperature: 0.9
+
+  openrouter/undi95/remm-slerp-l2-13b:
+    temperature: 0.9
+
+  openrouter/aion-labs/aion-rp-llama-3.1-8b:
+    temperature: 0.9
+
+  openrouter/mistralai/mistral-large-2512:
+    temperature: 0.8
+
+  openrouter/nothingiisreal/mn-celeste-12b:
+    temperature: 0.9
 
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.

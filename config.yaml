@@ -3,7 +3,7 @@
 bot_token_env: DISCORD_BOT_TOKEN
 client_id_env: DISCORD_CLIENT_ID
 
-status_message: 
+status_message: The offspring of Munkee.
 
 max_text: 100000
 max_images: 5

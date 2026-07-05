@@ -16,6 +16,40 @@ url_fetch_timeout: 10
 use_plain_responses: true
 allow_dms: true
 
+modules:
+  server_newspaper:
+    enabled: false
+    timezone: America/New_York
+    post_time: "00:00"
+    lookback_hours: 24
+    max_messages_per_channel: 150
+    max_total_messages: 800
+    ignored_channel_ids: []
+    model:
+
+  mediator:
+    enabled: true
+    model:
+    cooldown_seconds: 60
+
+  guess_user:
+    enabled: true
+    mode: opt_out
+    round_timeout_seconds: 60
+    allow_reuse_clues: false
+    min_players: 3
+    cooldown_seconds: 30
+    lookback_days: 90
+    max_messages_per_user: 300
+    max_messages_per_channel: 1000
+    ignored_channel_ids: []
+    include_bots: false
+    require_notice_before_scan: true
+    store_raw_messages: false
+    clue_safety_filter: true
+    scan_delay_seconds: 0.5
+    model:
+
 permissions:
   users:
     admin_ids: [206460137819340800]

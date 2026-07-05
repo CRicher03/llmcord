@@ -55,13 +55,16 @@ Or run local models with:
 - Customizable personality (aka system prompt)
 - Per-channel model and persona overrides with `/channelmodel` and `/persona`
 - Regenerate or summarize conversations with `/retry` and `/summarize`
+- Daily AI-generated server newspaper with `/newspaper`
+- Neutral low-stakes disagreement mediation with `/mediate`
+- Privacy-controlled Guess the User party game with `/guessuser`
 - Distinguishes users via their Discord IDs
 - Streamed responses (turns green when complete, automatically splits into separate messages when too long)
 - Hot reloading config (you can change settings without restarting the bot)
 - Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
 - Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
 - Fully asynchronous
-- 1 Python file, ~300 lines of code
+- Single-file bot with SQLite-backed social modules
 
 ## Instructions
 
@@ -96,6 +99,66 @@ Or run local models with:
 | **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
 | **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
+
+### Social modules:
+
+These modules are configured under `modules:` in `config.yaml`. Per-server runtime settings are stored in `llmcord.sqlite3`.
+
+#### Daily Server Newspaper
+
+Generates a fun, general-audience summary of the last 24 hours of readable public server activity. It ignores private/mod-only channels, channels the bot cannot read, and configured ignored channels.
+
+Commands:
+- `/newspaper set-channel #channel`
+- `/newspaper enable`
+- `/newspaper disable`
+- `/newspaper generate`
+- `/newspaper ignore-channel #channel`
+- `/newspaper unignore-channel #channel`
+- `/newspaper status`
+
+By default it posts at `00:00` in `America/New_York`. Change `modules.server_newspaper.timezone` or `post_time` in `config.yaml`.
+
+#### AI Mediator
+
+Use `/mediate topic:<text> side_a:<optional> side_b:<optional>` for neutral summaries of low-stakes disagreements, planning conflicts, and decision-making. It adds a disclaimer for serious topics and refuses to mediate threats, self-harm, abuse, harassment, violence, or emergencies.
+
+Admin controls:
+- `/mediator enable`
+- `/mediator disable`
+- `/mediator status`
+
+#### Guess the User
+
+An opt-out party game that creates safe, vague clues from public server messages. It does not use DMs, private channels, mod-only channels, ignored channels, deleted messages, bots, or sensitive topics. It stores generated clues and lightweight metadata, not raw message contents.
+
+Recommended setup:
+1. `/guessuser enable`
+2. `/guessuser post-notice`
+3. `/guessuser scan-server` or `/guessuser scan user:@user`
+4. `/guessuser start`
+
+Player commands:
+- `/guessuser start`
+- `/guessuser guess user:@user`
+- `/guessuser leaderboard`
+- `/guessuser privacy`
+- `/guessuser opt-out`
+- `/guessuser opt-in`
+- `/guessuser delete-my-data`
+- `/guessuser status`
+
+Admin commands:
+- `/guessuser scan user:@user`
+- `/guessuser scan-server`
+- `/guessuser rescan user:@user`
+- `/guessuser wipe-user user:@user`
+- `/guessuser ignore-channel #channel`
+- `/guessuser unignore-channel #channel`
+- `/guessuser post-notice`
+- `/guessuser remove-clue clue_id:<id>`
+- `/guessuser enable`
+- `/guessuser disable`
 
 3. Run the bot:
 

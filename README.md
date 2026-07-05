@@ -51,8 +51,10 @@ Or run local models with:
 
 ### And more:
 - Supports image attachments when using a vision model (like gpt-5, grok-4, claude-4, etc.)
-- Supports text file attachments (.txt, .py, .c, etc.)
+- Supports text, PDF, DOCX, and URL ingestion
 - Customizable personality (aka system prompt)
+- Per-channel model and persona overrides with `/channelmodel` and `/persona`
+- Regenerate or summarize conversations with `/retry` and `/summarize`
 - Distinguishes users via their Discord IDs
 - Streamed responses (turns green when complete, automatically splits into separate messages when too long)
 - Hot reloading config (you can change settings without restarting the bot)

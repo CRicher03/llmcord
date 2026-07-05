@@ -1,5 +1,8 @@
 discord.py>=2.6.0
+beautifulsoup4
 httpx
 openai
+pypdf
+python-docx
 python-dotenv
 pyyaml

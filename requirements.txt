@@ -2,9 +2,7 @@ discord.py>=2.6.0
 beautifulsoup4
 httpx
 openai
-PyNaCl
 pypdf
 python-docx
 python-dotenv
 pyyaml
-yt-dlp

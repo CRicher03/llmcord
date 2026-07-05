@@ -55,7 +55,6 @@ Or run local models with:
 - Customizable personality (aka system prompt)
 - Per-channel model and persona overrides with `/channelmodel` and `/persona`
 - Regenerate or summarize conversations with `/retry` and `/summarize`
-- Plays audio in voice channels from YouTube, direct audio streams, and other URLs with `/play`
 - Distinguishes users via their Discord IDs
 - Streamed responses (turns green when complete, automatically splits into separate messages when too long)
 - Hot reloading config (you can change settings without restarting the bot)
@@ -105,7 +104,6 @@ Or run local models with:
    python -m pip install -U -r requirements.txt
    python llmcord.py
    ```
-   Audio playback also requires `ffmpeg` to be installed and available on your `PATH`.
 
    **With Docker:**
    ```bash

@@ -362,6 +362,7 @@ last_task_time = 0
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 activity = discord.CustomActivity(name=(config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128])
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
@@ -969,7 +970,6 @@ def is_public_server_text_channel(channel: Any, ignored_channel_ids: set[int]) -
         bot_perms.view_channel
         and bot_perms.read_message_history
         and everyone_perms.view_channel
-        and everyone_perms.read_message_history
     )
 
 
@@ -1219,7 +1219,7 @@ def delete_guess_user_data(guild_id: int, user_id: int) -> None:
         conn.execute("DELETE FROM guess_user_scans WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
 
 
-async def collect_guess_user_messages(guild: discord.Guild, user: discord.Member, module_config: dict[str, Any], incremental: bool = True) -> list[str]:
+async def collect_guess_user_messages(guild: discord.Guild, user: Any, module_config: dict[str, Any], incremental: bool = True) -> list[str]:
     ignored_channel_ids = set(int(channel_id) for channel_id in module_config.get("ignored_channel_ids", []) or [])
     lookback_days = int(module_config.get("lookback_days", 90))
     max_per_user = int(module_config.get("max_messages_per_user", 300))
@@ -1286,7 +1286,7 @@ def parse_clue_json(raw_text: str) -> list[str]:
     return clues[:8]
 
 
-async def generate_guess_user_clues(guild: discord.Guild, user: discord.Member, samples: list[str], loaded_config: dict[str, Any]) -> list[str]:
+async def generate_guess_user_clues(guild: discord.Guild, user: Any, samples: list[str], loaded_config: dict[str, Any]) -> list[str]:
     if not samples:
         return []
 
@@ -1330,7 +1330,7 @@ def store_guess_user_clues(guild_id: int, user_id: int, clues: list[str], messag
     return inserted
 
 
-async def scan_guess_user(guild: discord.Guild, user: discord.Member, loaded_config: dict[str, Any], incremental: bool = True) -> tuple[int, int]:
+async def scan_guess_user(guild: discord.Guild, user: Any, loaded_config: dict[str, Any], incremental: bool = True) -> tuple[int, int]:
     module_config = get_module_config(loaded_config, "guess_user", guild.id)
     if user.bot and not module_config.get("include_bots", False):
         return 0, 0
@@ -1346,39 +1346,59 @@ async def scan_guess_user(guild: discord.Guild, user: discord.Member, loaded_con
 def get_random_guess_clue(guild: discord.Guild, loaded_config: dict[str, Any]) -> Optional[sqlite3.Row]:
     module_config = get_module_config(loaded_config, "guess_user", guild.id)
     allow_reuse = bool(module_config.get("allow_reuse_clues", False))
-    active_member_ids = {member.id for member in guild.members if not member.bot and not guess_user_is_opted_out(guild.id, member.id)}
-
-    if not active_member_ids:
-        return None
-
-    params: list[Any] = [guild.id, *active_member_ids]
-    placeholders = ",".join("?" for _ in active_member_ids)
     reuse_clause = "" if allow_reuse else "AND used_count = 0"
 
     with get_db() as conn:
         rows = conn.execute(
-            f"""
-            SELECT * FROM guess_user_clues
-            WHERE guild_id = ? AND active = 1 AND user_id IN ({placeholders}) {reuse_clause}
-            ORDER BY RANDOM()
-            LIMIT 1
-            """,
-            params,
+            f"""SELECT clues.*
+                FROM guess_user_clues AS clues
+                LEFT JOIN guess_user_optouts AS optouts
+                    ON optouts.guild_id = clues.guild_id AND optouts.user_id = clues.user_id
+                WHERE clues.guild_id = ?
+                    AND clues.active = 1
+                    AND optouts.user_id IS NULL
+                    {reuse_clause}
+                ORDER BY RANDOM()
+                LIMIT 1""",
+            (guild.id,),
         ).fetchall()
     return rows[0] if rows else None
 
 
 def active_clue_user_count(guild: discord.Guild) -> int:
-    active_member_ids = {member.id for member in guild.members if not member.bot and not guess_user_is_opted_out(guild.id, member.id)}
-    if not active_member_ids:
-        return 0
-    placeholders = ",".join("?" for _ in active_member_ids)
     with get_db() as conn:
         row = conn.execute(
-            f"SELECT COUNT(DISTINCT user_id) AS count FROM guess_user_clues WHERE guild_id = ? AND active = 1 AND user_id IN ({placeholders})",
-            [guild.id, *active_member_ids],
+            """SELECT COUNT(DISTINCT clues.user_id) AS count
+                FROM guess_user_clues AS clues
+                LEFT JOIN guess_user_optouts AS optouts
+                    ON optouts.guild_id = clues.guild_id AND optouts.user_id = clues.user_id
+                WHERE clues.guild_id = ?
+                    AND clues.active = 1
+                    AND optouts.user_id IS NULL""",
+            (guild.id,),
         ).fetchone()
     return int(row["count"] if row else 0)
+
+
+async def guild_has_member(guild: discord.Guild, user_id: int) -> bool:
+    if guild.get_member(user_id) is not None:
+        return True
+
+    try:
+        await guild.fetch_member(user_id)
+        return True
+    except discord.NotFound:
+        return False
+    except (discord.Forbidden, discord.HTTPException):
+        return True
+
+
+def deactivate_guess_user(guild_id: int, user_id: int) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE guess_user_clues SET active = 0 WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
 
 
 async def finish_guess_round(guild_id: int, channel_id: int, reveal: bool = True, winner_id: Optional[int] = None) -> None:
@@ -1640,7 +1660,16 @@ async def guessuser_start(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Not enough scanned, opted-in users have clues yet.", ephemeral=True)
         return
 
-    clue = get_random_guess_clue(interaction.guild, loaded_config)
+    clue = None
+    for _ in range(5):
+        candidate_clue = get_random_guess_clue(interaction.guild, loaded_config)
+        if not candidate_clue:
+            break
+        if await guild_has_member(interaction.guild, int(candidate_clue["user_id"])):
+            clue = candidate_clue
+            break
+        deactivate_guess_user(interaction.guild.id, int(candidate_clue["user_id"]))
+
     if not clue:
         await interaction.response.send_message("No available clues yet. An admin can run `/guessuser scan-server`.", ephemeral=True)
         return
@@ -1758,34 +1787,45 @@ async def guessuser_scan_server(interaction: discord.Interaction) -> None:
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
-    members_seen: dict[int, discord.Member] = {}
+    users_seen: dict[int, Any] = {}
     ignored_channel_ids = set(int(channel_id) for channel_id in module_config.get("ignored_channel_ids", []) or [])
     since = datetime.now().astimezone() - timedelta(days=int(module_config.get("lookback_days", 90)))
+    readable_channels = 0
+    skipped_channels = 0
+    candidate_messages = 0
 
     for channel in interaction.guild.text_channels:
         if not is_public_server_text_channel(channel, ignored_channel_ids):
+            skipped_channels += 1
             continue
+        readable_channels += 1
         logging.info("Guess the User scan-server reading channel %s in guild %s", channel.id, interaction.guild.id)
         try:
             async for message in channel.history(after=since, limit=int(module_config.get("max_messages_per_channel", 1000)), oldest_first=False):
                 if message.author.bot and not module_config.get("include_bots", False):
                     continue
-                member = interaction.guild.get_member(message.author.id)
-                if member and not guess_user_is_opted_out(interaction.guild.id, member.id):
-                    members_seen[member.id] = member
+                if not message.content:
+                    continue
+                if not guess_user_is_opted_out(interaction.guild.id, message.author.id):
+                    users_seen[message.author.id] = message.author
+                    candidate_messages += 1
         except (discord.Forbidden, discord.HTTPException):
             logging.exception("Skipping channel during Guess the User server scan: %s", channel.id)
         await asyncio.sleep(float(module_config.get("scan_delay_seconds", 0.5)))
 
     total_inserted = 0
     total_scanned = 0
-    for member in members_seen.values():
-        logging.info("Guess the User scan-server generating clues for user %s in guild %s", member.id, interaction.guild.id)
-        inserted, scanned = await scan_guess_user(interaction.guild, member, loaded_config, incremental=True)
+    for user in users_seen.values():
+        logging.info("Guess the User scan-server generating clues for user %s in guild %s", user.id, interaction.guild.id)
+        inserted, scanned = await scan_guess_user(interaction.guild, user, loaded_config, incremental=True)
         total_inserted += inserted
         total_scanned += scanned
 
-    await interaction.followup.send(f"Scanned {len(members_seen)} users and {total_scanned} messages; added {total_inserted} safe clues.", ephemeral=True)
+    await interaction.followup.send(
+        f"Scanned {len(users_seen)} users and {total_scanned} user messages; added {total_inserted} safe clues.\n"
+        f"Readable public channels: {readable_channels}. Skipped channels: {skipped_channels}. Candidate messages found: {candidate_messages}.",
+        ephemeral=True,
+    )
 
 
 @guessuser_group.command(name="wipe-user", description="Admin wipe of a user's Guess the User data")

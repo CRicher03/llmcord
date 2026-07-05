@@ -82,7 +82,7 @@ Or run local models with:
 
 | Setting | Description |
 | --- | --- |
-| **bot_token** | Create a new Discord bot at [discord.com/developers/applications](https://discord.com/developers/applications) and generate a token under the "Bot" tab. Also enable "MESSAGE CONTENT INTENT". |
+| **bot_token** | Create a new Discord bot at [discord.com/developers/applications](https://discord.com/developers/applications) and generate a token under the "Bot" tab. Also enable "MESSAGE CONTENT INTENT". For Guess the User, also enable "SERVER MEMBERS INTENT" so the bot can reliably verify current server members. |
 | **client_id** | Found under the "OAuth2" tab of the Discord bot you just made. |
 | **status_message** | Set a custom message that displays on the bot's Discord profile.<br /><br />**Max 128 characters.** |
 | **max_text** | The maximum amount of text allowed in a single message, including text from file attachments.<br /><br />Default: `100,000` |

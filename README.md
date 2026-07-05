@@ -57,7 +57,9 @@ Or run local models with:
 - Regenerate or summarize conversations with `/retry` and `/summarize`
 - Daily AI-generated server newspaper with `/newspaper`
 - Neutral low-stakes disagreement mediation with `/mediate`
-- Privacy-controlled Guess the User party game with `/guessuser`
+- Reputation titles with `/titles`
+- General-audience party games with `/party`
+- Attachment/file Q&A with `/file`
 - Distinguishes users via their Discord IDs
 - Streamed responses (turns green when complete, automatically splits into separate messages when too long)
 - Hot reloading config (you can change settings without restarting the bot)
@@ -82,7 +84,7 @@ Or run local models with:
 
 | Setting | Description |
 | --- | --- |
-| **bot_token** | Create a new Discord bot at [discord.com/developers/applications](https://discord.com/developers/applications) and generate a token under the "Bot" tab. Also enable "MESSAGE CONTENT INTENT". For Guess the User, also enable "SERVER MEMBERS INTENT" so the bot can reliably verify current server members. |
+| **bot_token** | Create a new Discord bot at [discord.com/developers/applications](https://discord.com/developers/applications) and generate a token under the "Bot" tab. Also enable "MESSAGE CONTENT INTENT". |
 | **client_id** | Found under the "OAuth2" tab of the Discord bot you just made. |
 | **status_message** | Set a custom message that displays on the bot's Discord profile.<br /><br />**Max 128 characters.** |
 | **max_text** | The maximum amount of text allowed in a single message, including text from file attachments.<br /><br />Default: `100,000` |
@@ -128,37 +130,63 @@ Admin controls:
 - `/mediator disable`
 - `/mediator status`
 
-#### Guess the User
+#### Reputation Titles
 
-An opt-out party game that creates safe, vague clues from public server messages. It does not use DMs, private channels, mod-only channels, ignored channels, deleted messages, bots, or sensitive topics. It stores generated clues and lightweight metadata, not raw message contents.
+Tracks lightweight, non-sensitive public server activity and awards fun titles such as `Night Owl`, `Early Bird`, `Link Supplier`, `Helpful Human`, `Reaction Magnet`, `Voice Chat Regular`, `Game Goblin`, and `Server Regular`.
 
-Recommended setup:
-1. `/guessuser enable`
-2. `/guessuser post-notice`
-3. `/guessuser scan-server` or `/guessuser scan user:@user`
-4. `/guessuser start`
+It ignores DMs, private/mod-only channels, ignored channels, bots, and users who opt out. It stores counters and earned titles only, not raw message contents.
 
 Player commands:
-- `/guessuser start`
-- `/guessuser guess user:@user`
-- `/guessuser leaderboard`
-- `/guessuser privacy`
-- `/guessuser opt-out`
-- `/guessuser opt-in`
-- `/guessuser delete-my-data`
-- `/guessuser status`
+- `/titles profile`
+- `/titles list`
+- `/titles equip title:<title>`
+- `/titles leaderboard`
+- `/titles opt-out`
+- `/titles opt-in`
 
 Admin commands:
-- `/guessuser scan user:@user`
-- `/guessuser scan-server`
-- `/guessuser rescan user:@user`
-- `/guessuser wipe-user user:@user`
-- `/guessuser ignore-channel #channel`
-- `/guessuser unignore-channel #channel`
-- `/guessuser post-notice`
-- `/guessuser remove-clue clue_id:<id>`
-- `/guessuser enable`
-- `/guessuser disable`
+- `/titles grant user:@user title:<title>`
+- `/titles remove user:@user title:<title>`
+- `/titles status`
+- `/titles enable`
+- `/titles disable`
+
+#### Party Game Pack
+
+Adds lightweight, general-audience games with per-server scores and history in SQLite. AI prompts are safe-filtered and fall back to static prompts if generation fails.
+
+Commands:
+- `/party would-you-rather`
+- `/party never-have-i-ever`
+- `/party this-or-that`
+- `/party trivia category:<category> difficulty:<difficulty>`
+- `/party two-truths-start statement_1:<text> statement_2:<text> statement_3:<text> lie_number:<1-3>`
+- `/party two-truths-guess lie_number:<1-3>`
+- `/party wordchain-start first_word:<word>`
+- `/party wordchain word:<word>`
+- `/party guess-start`
+- `/party guess-answer guess:<text>`
+- `/party leaderboard`
+- `/party stats`
+- `/party stop`
+- `/party status`
+- `/party enable game:<game>`
+- `/party disable game:<game>`
+
+#### Attachment Brain
+
+Lets users ask questions about uploaded files without storing file contents long-term. Supports common text/code/log files, PDFs, DOCX, JSON/CSV/Markdown, and images when a vision-capable model is configured.
+
+Commands:
+- `/file summarize attachment:<file>`
+- `/file ask attachment:<file> question:<text>`
+- `/file extract-text attachment:<file>`
+- `/file debug-log attachment:<file>`
+- `/file explain-code attachment:<file>`
+- `/file convert-json attachment:<file>`
+- `/file status`
+
+Configure limits with `modules.attachment_brain.max_file_size_mb`, `max_extracted_chars`, `allowed_extensions`, `model`, and `vision_model`.
 
 3. Run the bot:
 

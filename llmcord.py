@@ -64,22 +64,44 @@ DEFAULT_MODULES = {
         "model": None,
         "cooldown_seconds": 60,
     },
-    "guess_user": {
+    "reputation_titles": {
         "enabled": True,
-        "mode": "opt_out",
-        "round_timeout_seconds": 60,
-        "allow_reuse_clues": False,
-        "min_players": 3,
-        "cooldown_seconds": 30,
-        "lookback_days": 90,
-        "max_messages_per_user": 300,
-        "max_messages_per_channel": 1000,
+        "track_messages": True,
+        "track_voice": True,
+        "track_reactions": True,
+        "track_commands": True,
         "ignored_channel_ids": [],
-        "include_bots": False,
-        "require_notice_before_scan": True,
-        "store_raw_messages": False,
-        "clue_safety_filter": True,
-        "scan_delay_seconds": 0.5,
+        "spam_cooldown_seconds": 60,
+        "allow_user_opt_out": True,
+    },
+    "party_games": {
+        "enabled": True,
+        "cooldown_seconds": 20,
+        "default_round_timeout_seconds": 60,
+        "ai_generated_prompts": True,
+        "safe_mode": True,
+        "model": None,
+        "enabled_games": {
+            "would_you_rather": True,
+            "never_have_i_ever": True,
+            "two_truths_and_lie": True,
+            "word_chain": True,
+            "trivia": True,
+            "guess": True,
+            "this_or_that": True,
+        },
+    },
+    "attachment_brain": {
+        "enabled": True,
+        "max_file_size_mb": 10,
+        "max_extracted_chars": 50000,
+        "chunk_size_chars": 12000,
+        "store_file_contents": False,
+        "allowed_extensions": [
+            "txt", "md", "pdf", "docx", "csv", "json", "log", "py", "js", "ts", "html", "css", "lua",
+            "java", "cs", "cpp", "c", "go", "rs", "yaml", "yml", "toml", "ini", "png", "jpg", "jpeg", "webp",
+        ],
+        "vision_model": None,
         "model": None,
     },
 }
@@ -93,14 +115,6 @@ REFUSE_MEDIATION_RE = re.compile(
     r"\b(abuse|assault|emergency|harassment|kill|self[- ]?harm|suicide|threat|violence|weapon)\b",
     re.IGNORECASE,
 )
-UNSAFE_CLUE_RE = re.compile(
-    r"\b(abuse|address|anxiety|argu|bank|boyfriend|breakup|confess|custody|debt|depressed|depression|diagnos|"
-    r"divorce|doctor|drama|ethnic|family|fired|gay|gender|girlfriend|hospital|illness|job|lawsuit|legal|"
-    r"location|medical|mental|money|politic|race|religion|rent|school|sex|sexual|suicide|therapy|trauma|work)\b",
-    re.IGNORECASE,
-)
-
-
 def parse_env_value(value: Optional[str]) -> Any:
     if value is None:
         return None
@@ -164,49 +178,61 @@ def init_db() -> None:
                 PRIMARY KEY (guild_id, issue_date)
             );
 
-            CREATE TABLE IF NOT EXISTS guess_user_optouts (
+            CREATE TABLE IF NOT EXISTS reputation_title_stats (
                 guild_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
-                opted_out_at TEXT NOT NULL,
+                stat TEXT NOT NULL,
+                value INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, stat)
+            );
+
+            CREATE TABLE IF NOT EXISTS reputation_title_user_titles (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                earned_at TEXT NOT NULL,
+                granted_by INTEGER,
+                source TEXT NOT NULL DEFAULT 'auto',
+                PRIMARY KEY (guild_id, user_id, title)
+            );
+
+            CREATE TABLE IF NOT EXISTS reputation_title_profiles (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                equipped_title TEXT,
+                opted_out_at TEXT,
                 PRIMARY KEY (guild_id, user_id)
             );
 
-            CREATE TABLE IF NOT EXISTS guess_user_clues (
+            CREATE TABLE IF NOT EXISTS party_game_scores (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                score INTEGER NOT NULL DEFAULT 0,
+                streak INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id, game)
+            );
+
+            CREATE TABLE IF NOT EXISTS party_game_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                clue TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                last_used_at TEXT,
-                used_count INTEGER NOT NULL DEFAULT 0,
-                active INTEGER NOT NULL DEFAULT 1
+                channel_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                user_id INTEGER,
+                result TEXT,
+                created_at TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS guess_user_scores (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                score INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (guild_id, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS guess_user_scans (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                last_scan_at TEXT NOT NULL,
-                message_count INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (guild_id, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS guess_user_rounds (
+            CREATE TABLE IF NOT EXISTS party_game_states (
                 guild_id INTEGER NOT NULL,
                 channel_id INTEGER NOT NULL,
-                message_id INTEGER,
-                clue_id INTEGER NOT NULL,
-                answer_user_id INTEGER NOT NULL,
-                started_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                status TEXT NOT NULL,
-                PRIMARY KEY (guild_id, channel_id)
+                game TEXT NOT NULL,
+                state TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, channel_id, game)
             );
             """
         )
@@ -354,15 +380,15 @@ curr_model = next(iter(config["models"]))
 channel_settings = load_channel_settings()
 
 msg_nodes = {}
-active_guess_rounds = {}
 mediator_cooldowns = {}
-guess_user_cooldowns = {}
+reputation_cooldowns = {}
+party_cooldowns = {}
+party_rounds = {}
 newspaper_task: Optional[asyncio.Task] = None
 last_task_time = 0
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
 activity = discord.CustomActivity(name=(config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128])
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
@@ -1187,252 +1213,411 @@ async def run_mediator(interaction: discord.Interaction, topic: str, side_a: Opt
     return disclaimer + await generate_module_text(loaded_config, provider_slash_model, messages)
 
 
-def guess_user_enabled(guild_id: int, loaded_config: dict[str, Any]) -> bool:
-    return bool(get_module_config(loaded_config, "guess_user", guild_id).get("enabled", True))
+TITLE_RULES = {
+    "Night Owl": ("night_messages", 10),
+    "Early Bird": ("early_messages", 10),
+    "Link Supplier": ("links", 10),
+    "Question Asker": ("questions", 15),
+    "Helpful Human": ("thanks_received", 5),
+    "Reaction Magnet": ("reactions_received", 25),
+    "Conversation Starter": ("conversation_starts", 10),
+    "Voice Chat Regular": ("voice_joins", 8),
+    "Music Menace": ("music_commands", 5),
+    "Poll Goblin": ("poll_activity", 5),
+    "Game Goblin": ("party_games", 5),
+    "Server Regular": ("active_days", 7),
+}
+
+STATIC_PROMPTS = {
+    "would_you_rather": [
+        ("Have unlimited snacks during movie night", "Have perfect seats at every concert"),
+        ("Always win board games", "Always pick the best restaurant"),
+        ("Live in a cozy cabin for a month", "Live in a beach house for a month"),
+    ],
+    "never_have_i_ever": [
+        "forgotten why I walked into a room",
+        "sent a message to the wrong chat",
+        "started a game backlog and made it worse",
+        "laughed at my own typo",
+    ],
+    "this_or_that": [
+        ("Pizza night", "Taco night"),
+        ("Co-op games", "Competitive games"),
+        ("Rainy day playlist", "Sunny day playlist"),
+    ],
+    "trivia": [
+        ("general", "easy", "What planet is known as the Red Planet?", ["Mars", "Venus", "Jupiter", "Mercury"], 0),
+        ("gaming", "easy", "Which game features blocks, crafting, and Creepers?", ["Minecraft", "Stardew Valley", "Portal", "Hades"], 0),
+        ("science", "easy", "What gas do plants absorb from the air?", ["Carbon dioxide", "Helium", "Oxygen", "Neon"], 0),
+        ("movies", "easy", "What is the name of the toy cowboy in Toy Story?", ["Woody", "Buzz", "Andy", "Rex"], 0),
+    ],
+    "guess": [
+        ("object", "backpack"),
+        ("place", "library"),
+        ("thing", "headphones"),
+        ("character", "Mario"),
+    ],
+}
+
+SAFE_GAME_RE = re.compile(r"\b(sex|sexual|kill|murder|suicide|self[- ]?harm|hate|slur|drug|illegal|abuse|harass|explicit|nsfw)\b", re.IGNORECASE)
 
 
-def guess_user_is_opted_out(guild_id: int, user_id: int) -> bool:
+def reputation_enabled(guild_id: int, loaded_config: dict[str, Any]) -> bool:
+    return bool(get_module_config(loaded_config, "reputation_titles", guild_id).get("enabled", True))
+
+
+def reputation_is_opted_out(guild_id: int, user_id: int) -> bool:
     with get_db() as conn:
         row = conn.execute(
-            "SELECT 1 FROM guess_user_optouts WHERE guild_id = ? AND user_id = ?",
+            "SELECT opted_out_at FROM reputation_title_profiles WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
         ).fetchone()
-    return row is not None
+    return bool(row and row["opted_out_at"])
 
 
-def set_guess_user_optout(guild_id: int, user_id: int, opted_out: bool) -> None:
+def set_reputation_optout(guild_id: int, user_id: int, opted_out: bool) -> None:
     with get_db() as conn:
         if opted_out:
             conn.execute(
-                "INSERT OR REPLACE INTO guess_user_optouts (guild_id, user_id, opted_out_at) VALUES (?, ?, ?)",
+                "INSERT INTO reputation_title_profiles (guild_id, user_id, opted_out_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(guild_id, user_id) DO UPDATE SET opted_out_at = excluded.opted_out_at",
                 (guild_id, user_id, now_iso()),
             )
-            conn.execute("UPDATE guess_user_clues SET active = 0 WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
         else:
-            conn.execute("DELETE FROM guess_user_optouts WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-
-
-def delete_guess_user_data(guild_id: int, user_id: int) -> None:
-    with get_db() as conn:
-        conn.execute("DELETE FROM guess_user_clues WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-        conn.execute("DELETE FROM guess_user_scores WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-        conn.execute("DELETE FROM guess_user_scans WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-
-
-async def collect_guess_user_messages(guild: discord.Guild, user: Any, module_config: dict[str, Any], incremental: bool = True) -> list[str]:
-    ignored_channel_ids = set(int(channel_id) for channel_id in module_config.get("ignored_channel_ids", []) or [])
-    lookback_days = int(module_config.get("lookback_days", 90))
-    max_per_user = int(module_config.get("max_messages_per_user", 300))
-    max_per_channel = int(module_config.get("max_messages_per_channel", 1000))
-    since = datetime.now().astimezone() - timedelta(days=lookback_days)
-
-    if incremental:
-        with get_db() as conn:
-            row = conn.execute(
-                "SELECT last_scan_at FROM guess_user_scans WHERE guild_id = ? AND user_id = ?",
-                (guild.id, user.id),
-            ).fetchone()
-        if row:
-            try:
-                since = max(since, datetime.fromisoformat(row["last_scan_at"]))
-            except ValueError:
-                pass
-
-    samples = []
-    for channel in guild.text_channels:
-        if not is_public_server_text_channel(channel, ignored_channel_ids):
-            continue
-
-        seen_in_channel = 0
-        try:
-            async for message in channel.history(after=since, limit=max_per_channel, oldest_first=False):
-                if message.author.id != user.id or not message.content:
-                    continue
-                text = safe_message_text(message, max_len=300)
-                if text and not UNSAFE_CLUE_RE.search(text):
-                    samples.append(text)
-                seen_in_channel += 1
-                if len(samples) >= max_per_user or seen_in_channel >= max_per_channel:
-                    break
-        except (discord.Forbidden, discord.HTTPException):
-            logging.exception("Skipping channel during Guess the User scan: %s", channel.id)
-
-        if len(samples) >= max_per_user:
-            break
-
-        await asyncio.sleep(float(module_config.get("scan_delay_seconds", 0.5)))
-
-    return samples
-
-
-def parse_clue_json(raw_text: str) -> list[str]:
-    text = raw_text.strip()
-    match = re.search(r"\[[\s\S]*\]", text)
-    if match:
-        text = match.group(0)
-
-    parsed = json_loads(text, [])
-    if isinstance(parsed, dict):
-        parsed = parsed.get("clues", [])
-    if not isinstance(parsed, list):
-        return []
-
-    clues = []
-    for clue in parsed:
-        if isinstance(clue, str):
-            cleaned = normalize_extracted_text(clue)
-            if 15 <= len(cleaned) <= 160 and not UNSAFE_CLUE_RE.search(cleaned):
-                clues.append(cleaned)
-    return clues[:8]
-
-
-async def generate_guess_user_clues(guild: discord.Guild, user: Any, samples: list[str], loaded_config: dict[str, Any]) -> list[str]:
-    if not samples:
-        return []
-
-    module_config = get_module_config(loaded_config, "guess_user", guild.id)
-    prompt = (
-        "Generate 3 to 8 safe, vague, general-audience Guess the User clues from these public Discord messages. "
-        "Return JSON only: an array of strings. Do not mention private, sensitive, embarrassing, identity, health, "
-        "relationship, money, legal, workplace, school, family, political, religious, location, drama, argument, or venting details. "
-        "Prefer harmless repeated hobbies, games, media, catchphrases, posting habits, and light server-safe topics. "
-        "If unsure, omit the clue. Do not identify the user by name.\n\n"
-        "Messages:\n" + "\n".join(f"- {sample}" for sample in samples[-120:])
-    )
-    messages = [
-        dict(role="system", content="You generate only safe, non-sensitive party-game clues as JSON."),
-        dict(role="user", content=prompt),
-    ]
-    raw_text = await generate_module_text(loaded_config, module_model(loaded_config, module_config, None), messages)
-    return parse_clue_json(raw_text)
-
-
-def store_guess_user_clues(guild_id: int, user_id: int, clues: list[str], message_count: int) -> int:
-    inserted = 0
-    with get_db() as conn:
-        for clue in clues:
-            existing = conn.execute(
-                "SELECT 1 FROM guess_user_clues WHERE guild_id = ? AND user_id = ? AND clue = ? AND active = 1",
-                (guild_id, user_id, clue),
-            ).fetchone()
-            if existing:
-                continue
             conn.execute(
-                "INSERT INTO guess_user_clues (guild_id, user_id, clue, created_at) VALUES (?, ?, ?, ?)",
-                (guild_id, user_id, clue, now_iso()),
+                "INSERT INTO reputation_title_profiles (guild_id, user_id, opted_out_at) VALUES (?, ?, NULL) "
+                "ON CONFLICT(guild_id, user_id) DO UPDATE SET opted_out_at = NULL",
+                (guild_id, user_id),
             )
-            inserted += 1
 
+
+def increment_reputation_stat(guild_id: int, user_id: int, stat: str, amount: int = 1) -> int:
+    with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO guess_user_scans (guild_id, user_id, last_scan_at, message_count) VALUES (?, ?, ?, ?)",
-            (guild_id, user_id, now_iso(), message_count),
+            "INSERT INTO reputation_title_stats (guild_id, user_id, stat, value, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id, stat) DO UPDATE SET value = value + excluded.value, updated_at = excluded.updated_at",
+            (guild_id, user_id, stat, amount, now_iso()),
         )
-    return inserted
-
-
-async def scan_guess_user(guild: discord.Guild, user: Any, loaded_config: dict[str, Any], incremental: bool = True) -> tuple[int, int]:
-    module_config = get_module_config(loaded_config, "guess_user", guild.id)
-    if user.bot and not module_config.get("include_bots", False):
-        return 0, 0
-    if guess_user_is_opted_out(guild.id, user.id):
-        return 0, 0
-
-    samples = await collect_guess_user_messages(guild, user, module_config, incremental=incremental)
-    clues = await generate_guess_user_clues(guild, user, samples, loaded_config)
-    inserted = store_guess_user_clues(guild.id, user.id, clues, len(samples))
-    return inserted, len(samples)
-
-
-def get_random_guess_clue(guild: discord.Guild, loaded_config: dict[str, Any]) -> Optional[sqlite3.Row]:
-    module_config = get_module_config(loaded_config, "guess_user", guild.id)
-    allow_reuse = bool(module_config.get("allow_reuse_clues", False))
-    reuse_clause = "" if allow_reuse else "AND used_count = 0"
-
-    with get_db() as conn:
-        rows = conn.execute(
-            f"""SELECT clues.*
-                FROM guess_user_clues AS clues
-                LEFT JOIN guess_user_optouts AS optouts
-                    ON optouts.guild_id = clues.guild_id AND optouts.user_id = clues.user_id
-                WHERE clues.guild_id = ?
-                    AND clues.active = 1
-                    AND optouts.user_id IS NULL
-                    {reuse_clause}
-                ORDER BY RANDOM()
-                LIMIT 1""",
-            (guild.id,),
-        ).fetchall()
-    return rows[0] if rows else None
-
-
-def active_clue_user_count(guild: discord.Guild) -> int:
-    with get_db() as conn:
         row = conn.execute(
-            """SELECT COUNT(DISTINCT clues.user_id) AS count
-                FROM guess_user_clues AS clues
-                LEFT JOIN guess_user_optouts AS optouts
-                    ON optouts.guild_id = clues.guild_id AND optouts.user_id = clues.user_id
-                WHERE clues.guild_id = ?
-                    AND clues.active = 1
-                    AND optouts.user_id IS NULL""",
-            (guild.id,),
+            "SELECT value FROM reputation_title_stats WHERE guild_id = ? AND user_id = ? AND stat = ?",
+            (guild_id, user_id, stat),
         ).fetchone()
-    return int(row["count"] if row else 0)
+    return int(row["value"] if row else 0)
 
 
-async def guild_has_member(guild: discord.Guild, user_id: int) -> bool:
-    if guild.get_member(user_id) is not None:
-        return True
+def grant_reputation_title(guild_id: int, user_id: int, title: str, source: str = "auto", granted_by: Optional[int] = None) -> bool:
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM reputation_title_user_titles WHERE guild_id = ? AND user_id = ? AND title = ?",
+            (guild_id, user_id, title),
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            "INSERT INTO reputation_title_user_titles (guild_id, user_id, title, earned_at, granted_by, source) VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, title, now_iso(), granted_by, source),
+        )
+    return True
 
-    try:
-        await guild.fetch_member(user_id)
-        return True
-    except discord.NotFound:
-        return False
-    except (discord.Forbidden, discord.HTTPException):
-        return True
 
-
-def deactivate_guess_user(guild_id: int, user_id: int) -> None:
+def remove_reputation_title(guild_id: int, user_id: int, title: str) -> None:
     with get_db() as conn:
         conn.execute(
-            "UPDATE guess_user_clues SET active = 0 WHERE guild_id = ? AND user_id = ?",
-            (guild_id, user_id),
+            "DELETE FROM reputation_title_user_titles WHERE guild_id = ? AND user_id = ? AND title = ?",
+            (guild_id, user_id, title),
+        )
+        conn.execute(
+            "UPDATE reputation_title_profiles SET equipped_title = NULL WHERE guild_id = ? AND user_id = ? AND equipped_title = ?",
+            (guild_id, user_id, title),
         )
 
 
-async def finish_guess_round(guild_id: int, channel_id: int, reveal: bool = True, winner_id: Optional[int] = None) -> None:
-    round_info = active_guess_rounds.pop((guild_id, channel_id), None)
-    if not round_info:
+def maybe_award_reputation_titles(guild_id: int, user_id: int, stat: str, value: int) -> list[str]:
+    awarded = []
+    for title, (rule_stat, threshold) in TITLE_RULES.items():
+        if rule_stat == stat and value >= threshold and grant_reputation_title(guild_id, user_id, title):
+            awarded.append(title)
+    return awarded
+
+
+async def track_reputation_stat(guild_id: int, user_id: int, stat: str, loaded_config: dict[str, Any], amount: int = 1, cooldown_key: Optional[tuple[Any, ...]] = None) -> None:
+    if not reputation_enabled(guild_id, loaded_config) or reputation_is_opted_out(guild_id, user_id):
         return
 
-    guild = discord_bot.get_guild(guild_id)
-    channel = guild.get_channel(channel_id) if guild else None
-    answer_user_id = round_info["answer_user_id"]
-    clue_id = round_info["clue_id"]
+    module_config = get_module_config(loaded_config, "reputation_titles", guild_id)
+    cooldown_seconds = int(module_config.get("spam_cooldown_seconds", 60))
+    if cooldown_key:
+        now_ts = datetime.now().timestamp()
+        key = (guild_id, user_id, stat, *cooldown_key)
+        if reputation_cooldowns.get(key, 0) > now_ts:
+            return
+        reputation_cooldowns[key] = now_ts + cooldown_seconds
 
+    value = increment_reputation_stat(guild_id, user_id, stat, amount)
+    maybe_award_reputation_titles(guild_id, user_id, stat, value)
+
+
+async def track_reputation_message(message: discord.Message, loaded_config: dict[str, Any]) -> None:
+    if message.guild is None or message.author.bot:
+        return
+
+    module_config = get_module_config(loaded_config, "reputation_titles", message.guild.id)
+    if not module_config.get("track_messages", True):
+        return
+    if not is_public_server_text_channel(message.channel, set(int(id) for id in module_config.get("ignored_channel_ids", []) or [])):
+        return
+
+    await track_reputation_stat(message.guild.id, message.author.id, "messages", loaded_config, cooldown_key=(message.channel.id,))
+    today_stat = f"active_day:{datetime.now().astimezone().date().isoformat()}"
+    if increment_reputation_stat(message.guild.id, message.author.id, today_stat, 1) == 1:
+        value = increment_reputation_stat(message.guild.id, message.author.id, "active_days", 1)
+        maybe_award_reputation_titles(message.guild.id, message.author.id, "active_days", value)
+
+    content = message.content or ""
+    local_hour = datetime.now().astimezone().hour
+    if local_hour >= 23 or local_hour < 5:
+        await track_reputation_stat(message.guild.id, message.author.id, "night_messages", loaded_config, cooldown_key=("night",))
+    if 5 <= local_hour < 9:
+        await track_reputation_stat(message.guild.id, message.author.id, "early_messages", loaded_config, cooldown_key=("early",))
+    if URL_RE.search(content):
+        await track_reputation_stat(message.guild.id, message.author.id, "links", loaded_config, cooldown_key=("link",))
+    if "?" in content:
+        await track_reputation_stat(message.guild.id, message.author.id, "questions", loaded_config, cooldown_key=("question",))
+    if message.reference is None and len(content) > 20:
+        await track_reputation_stat(message.guild.id, message.author.id, "conversation_starts", loaded_config, cooldown_key=("starter", message.channel.id))
+    if "poll" in content.lower():
+        await track_reputation_stat(message.guild.id, message.author.id, "poll_activity", loaded_config, cooldown_key=("poll",))
+
+
+def user_titles(guild_id: int, user_id: int) -> tuple[list[str], Optional[str]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT title FROM reputation_title_user_titles WHERE guild_id = ? AND user_id = ? ORDER BY title",
+            (guild_id, user_id),
+        ).fetchall()
+        profile = conn.execute(
+            "SELECT equipped_title FROM reputation_title_profiles WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ).fetchone()
+    return [row["title"] for row in rows], (profile["equipped_title"] if profile else None)
+
+
+def party_enabled(guild_id: int, loaded_config: dict[str, Any], game: Optional[str] = None) -> bool:
+    module_config = get_module_config(loaded_config, "party_games", guild_id)
+    if not module_config.get("enabled", True):
+        return False
+    if game:
+        return bool((module_config.get("enabled_games") or {}).get(game, True))
+    return True
+
+
+def party_on_cooldown(guild_id: int, user_id: int, loaded_config: dict[str, Any]) -> Optional[int]:
+    module_config = get_module_config(loaded_config, "party_games", guild_id)
+    cooldown_seconds = int(module_config.get("cooldown_seconds", 20))
+    key = (guild_id, user_id)
+    now_ts = datetime.now().timestamp()
+    if party_cooldowns.get(key, 0) > now_ts:
+        return int(party_cooldowns[key] - now_ts)
+    party_cooldowns[key] = now_ts + cooldown_seconds
+    return None
+
+
+def add_party_score(guild_id: int, user_id: int, game: str, points: int = 1, streak_delta: int = 1) -> None:
     with get_db() as conn:
         conn.execute(
-            "UPDATE guess_user_rounds SET status = ? WHERE guild_id = ? AND channel_id = ?",
-            ("complete", guild_id, channel_id),
+            "INSERT INTO party_game_scores (guild_id, user_id, game, score, streak, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id, game) DO UPDATE SET score = score + excluded.score, streak = MAX(0, streak + excluded.streak), updated_at = excluded.updated_at",
+            (guild_id, user_id, game, points, streak_delta, now_iso()),
         )
         conn.execute(
-            "UPDATE guess_user_clues SET last_used_at = ?, used_count = used_count + 1 WHERE id = ?",
-            (now_iso(), clue_id),
+            "INSERT INTO reputation_title_stats (guild_id, user_id, stat, value, updated_at) VALUES (?, ?, 'party_games', 1, ?) "
+            "ON CONFLICT(guild_id, user_id, stat) DO UPDATE SET value = value + 1, updated_at = excluded.updated_at",
+            (guild_id, user_id, now_iso()),
+        )
+        row = conn.execute(
+            "SELECT value FROM reputation_title_stats WHERE guild_id = ? AND user_id = ? AND stat = 'party_games'",
+            (guild_id, user_id),
+        ).fetchone()
+    if row:
+        maybe_award_reputation_titles(guild_id, user_id, "party_games", int(row["value"]))
+
+
+def record_party_history(guild_id: int, channel_id: int, game: str, user_id: Optional[int], result: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO party_game_history (guild_id, channel_id, game, user_id, result, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, game, user_id, result, now_iso()),
         )
 
-    if reveal and channel:
-        answer_member = guild.get_member(answer_user_id) if guild else None
-        answer = answer_member.mention if answer_member else f"<@{answer_user_id}>"
-        if winner_id:
-            await channel.send(f"Correct, <@{winner_id}>! The answer was {answer}.")
+
+async def safe_ai_game_prompt(interaction: discord.Interaction, game: str, loaded_config: dict[str, Any], fallback: Any) -> Any:
+    module_config = get_module_config(loaded_config, "party_games", interaction.guild.id)
+    if not module_config.get("ai_generated_prompts", True):
+        return fallback
+    prompt = (
+        f"Generate one safe, general-audience Discord party game prompt for {game}. "
+        "Avoid sexual, hateful, violent, self-harm, illegal, harassment, invasive, or embarrassing content. "
+        "Return compact JSON only."
+    )
+    try:
+        text = await generate_module_text(
+            loaded_config,
+            module_model(loaded_config, module_config, interaction.channel),
+            [dict(role="system", content="You generate safe party game prompts as JSON only."), dict(role="user", content=prompt)],
+        )
+        if SAFE_GAME_RE.search(text):
+            return fallback
+        parsed = json_loads(re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text).group(0) if re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text) else text, None)
+        return parsed or fallback
+    except Exception:
+        logging.exception("AI party prompt generation failed")
+        return fallback
+
+
+class VoteView(discord.ui.View):
+    def __init__(self, labels: list[str], timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.votes: dict[int, int] = {}
+        for index, label in enumerate(labels):
+            self.add_item(VoteButton(label[:80], index))
+
+    def results(self) -> list[int]:
+        counts = [0 for _ in self.children]
+        for vote in self.votes.values():
+            if 0 <= vote < len(counts):
+                counts[vote] += 1
+        return counts
+
+
+class VoteButton(discord.ui.Button):
+    def __init__(self, label: str, index: int):
+        super().__init__(label=label, style=discord.ButtonStyle.primary)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if isinstance(view, VoteView):
+            view.votes[interaction.user.id] = self.index
+        await interaction.response.send_message("Vote counted.", ephemeral=True)
+
+
+class TriviaView(discord.ui.View):
+    def __init__(self, guild_id: int, game: str, answers: list[str], correct_index: int, timeout: int = 60):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+        self.game = game
+        self.correct_index = correct_index
+        self.answered: set[int] = set()
+        for index, answer in enumerate(answers):
+            self.add_item(TriviaButton(answer[:80], index))
+
+
+class TriviaButton(discord.ui.Button):
+    def __init__(self, label: str, index: int):
+        super().__init__(label=label, style=discord.ButtonStyle.secondary)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = self.view
+        if not isinstance(view, TriviaView):
+            return
+        if interaction.user.id in view.answered:
+            await interaction.response.send_message("You already answered.", ephemeral=True)
+            return
+        view.answered.add(interaction.user.id)
+        if self.index == view.correct_index:
+            add_party_score(view.guild_id, interaction.user.id, view.game, 1, 1)
+            await interaction.response.send_message("Correct!", ephemeral=True)
         else:
-            await channel.send(f"Time! The answer was {answer}.")
+            add_party_score(view.guild_id, interaction.user.id, view.game, 0, -1)
+            await interaction.response.send_message("Not quite.", ephemeral=True)
+
+
+def attachment_extension(attachment: discord.Attachment) -> str:
+    return attachment.filename.rsplit(".", 1)[-1].lower() if "." in attachment.filename else ""
+
+
+def attachment_is_image(attachment: discord.Attachment) -> bool:
+    return (attachment.content_type or "").lower().startswith("image/") or attachment_extension(attachment) in {"png", "jpg", "jpeg", "webp"}
+
+
+async def extract_attachment_for_brain(attachment: discord.Attachment, module_config: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str]]:
+    warnings = []
+    max_file_size = int(float(module_config.get("max_file_size_mb", 10)) * 1024 * 1024)
+    max_chars = int(module_config.get("max_extracted_chars", 50000))
+    extension = attachment_extension(attachment)
+    allowed_extensions = set(module_config.get("allowed_extensions", []) or [])
+
+    if extension not in allowed_extensions:
+        raise ValueError(f"Unsupported file type: .{extension or 'unknown'}")
+    if attachment.size and attachment.size > max_file_size:
+        raise ValueError(f"File is too large. Limit is {module_config.get('max_file_size_mb', 10)} MB.")
+
+    response = await httpx_client.get(attachment.url)
+    response.raise_for_status()
+
+    if attachment_is_image(attachment):
+        return "", [dict(type="image_url", image_url=dict(url=f"data:{attachment.content_type};base64,{b64encode(response.content).decode('utf-8')}"))], warnings
+
+    kind = get_attachment_kind(attachment)
+    if kind == "pdf":
+        text = await asyncio.to_thread(extract_pdf_text, response.content)
+    elif kind == "docx":
+        text = await asyncio.to_thread(extract_docx_text, response.content)
+    else:
+        text = response.text
+
+    text = normalize_extracted_text(text)
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        warnings.append(f"Extracted text was truncated to {max_chars:,} characters.")
+    return text, [], warnings
+
+
+async def run_attachment_brain(interaction: discord.Interaction, attachment: discord.Attachment, task: str, question: Optional[str] = None) -> str:
+    loaded_config = await asyncio.to_thread(get_config)
+    module_config = get_module_config(loaded_config, "attachment_brain", interaction.guild.id if interaction.guild else None)
+    if not module_config.get("enabled", True):
+        return "Attachment Brain is disabled."
+
+    text, images, warnings = await extract_attachment_for_brain(attachment, module_config)
+    provider_slash_model = module_config.get("model") if module_config.get("model") in loaded_config["models"] else get_effective_model(interaction.channel, loaded_config)
+
+    if images:
+        vision_model = module_config.get("vision_model")
+        if vision_model in loaded_config["models"]:
+            provider_slash_model = vision_model
+        elif not any(tag in provider_slash_model.lower() for tag in VISION_MODEL_TAGS):
+            return "Image understanding requires a vision-capable model. Set `modules.attachment_brain.vision_model` or use a vision model in this channel."
+
+    if task == "extract-text":
+        if not text:
+            return "No readable text was extracted."
+        preview = text if len(text) <= 1800 else text[:1800] + "\n\n...[truncated preview]"
+        return "\n".join(warnings + [preview])
+
+    instruction = {
+        "summarize": "Summarize the main points of this file.",
+        "ask": f"Answer this question based only on the file. If the answer is not in the file, say so.\nQuestion: {question}",
+        "debug-log": "Analyze this log. Identify likely causes, important errors, and practical fixes.",
+        "explain-code": "Explain what this code does, identify obvious bugs or risky parts, and suggest improvements. Do not execute it.",
+        "convert-json": "Convert or normalize the file content into clear JSON if reasonable. If not possible, explain why.",
+    }.get(task, "Analyze this file.")
+
+    content = [dict(type="text", text=f"File: {attachment.filename}\nTask: {instruction}\n\nExtracted text:\n{text or '[image attached]'}")] + images
+    messages = [
+        dict(role="system", content="You answer questions about uploaded files safely. Do not execute untrusted code."),
+        dict(role="user", content=content if images else content[0]["text"]),
+    ]
+    answer = await generate_module_text(loaded_config, provider_slash_model, messages)
+    return "\n".join(warnings + [answer])
 
 
 newspaper_group = discord.app_commands.Group(name="newspaper", description="Daily server newspaper controls")
 mediator_group = discord.app_commands.Group(name="mediator", description="AI mediator module controls")
-guessuser_group = discord.app_commands.Group(name="guessuser", description="Guess the User party game")
+titles_group = discord.app_commands.Group(name="titles", description="Reputation title profiles")
+party_group = discord.app_commands.Group(name="party", description="General-audience party games")
+file_group = discord.app_commands.Group(name="file", description="Ask questions about uploaded files")
 
 
 @newspaper_group.command(name="generate", description="Generate today's server newspaper now")
@@ -1579,315 +1764,426 @@ async def mediator_status(interaction: discord.Interaction) -> None:
     )
 
 
-@guessuser_group.command(name="enable", description="Enable Guess the User")
-async def guessuser_enable(interaction: discord.Interaction) -> None:
-    loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
+@titles_group.command(name="profile", description="View your reputation title profile")
+async def titles_profile(interaction: discord.Interaction, user: Optional[discord.Member] = None) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-    set_module_setting(interaction.guild.id, "guess_user", "enabled", True)
-    await interaction.response.send_message("Guess the User enabled.", ephemeral=True)
-
-
-@guessuser_group.command(name="disable", description="Disable Guess the User")
-async def guessuser_disable(interaction: discord.Interaction) -> None:
-    loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
-        return
-    set_module_setting(interaction.guild.id, "guess_user", "enabled", False)
-    await interaction.response.send_message("Guess the User disabled.", ephemeral=True)
-
-
-@guessuser_group.command(name="privacy", description="Explain Guess the User privacy controls")
-async def guessuser_privacy(interaction: discord.Interaction) -> None:
+    target = user or interaction.user
+    titles, equipped = user_titles(interaction.guild.id, target.id)
+    with get_db() as conn:
+        stats = conn.execute(
+            "SELECT stat, value FROM reputation_title_stats WHERE guild_id = ? AND user_id = ? ORDER BY value DESC LIMIT 8",
+            (interaction.guild.id, target.id),
+        ).fetchall()
+    stat_text = ", ".join(f"{row['stat']}: {row['value']}" for row in stats) or "No tracked stats yet."
+    title_text = ", ".join(titles) or "No titles yet."
     await interaction.response.send_message(
-        "Guess the User uses only public server messages from channels the bot can read. It avoids private/mod-only channels, ignored channels, bots, deleted messages, and sensitive topics. "
-        "It stores generated safe clues and lightweight metadata, not raw message history. Use `/guessuser opt-out` anytime, and `/guessuser delete-my-data` to remove your clues, scan metadata, and score.",
-        ephemeral=True,
+        f"Profile for {target.mention}\nEquipped: `{equipped or 'none'}`\nTitles: {title_text}\nStats: {stat_text}",
+        ephemeral=user is None,
     )
 
 
-@guessuser_group.command(name="opt-out", description="Opt out of Guess the User")
-async def guessuser_opt_out(interaction: discord.Interaction) -> None:
+@titles_group.command(name="list", description="List available reputation titles")
+async def titles_list(interaction: discord.Interaction) -> None:
+    lines = [f"- **{title}**: `{stat}` >= {threshold}" for title, (stat, threshold) in TITLE_RULES.items()]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@titles_group.command(name="equip", description="Equip one of your earned titles")
+async def titles_equip(interaction: discord.Interaction, title: str) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-    set_guess_user_optout(interaction.guild.id, interaction.user.id, True)
-    await interaction.response.send_message("You are opted out, and your active clues were disabled.", ephemeral=True)
-
-
-@guessuser_group.command(name="opt-in", description="Opt back into Guess the User")
-async def guessuser_opt_in(interaction: discord.Interaction) -> None:
-    if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+    titles, _ = user_titles(interaction.guild.id, interaction.user.id)
+    if title not in titles:
+        await interaction.response.send_message("You have not earned that title.", ephemeral=True)
         return
-    set_guess_user_optout(interaction.guild.id, interaction.user.id, False)
-    await interaction.response.send_message("You are opted in again. Admins can rescan you to generate fresh clues.", ephemeral=True)
-
-
-@guessuser_group.command(name="delete-my-data", description="Delete your Guess the User data")
-async def guessuser_delete_my_data(interaction: discord.Interaction) -> None:
-    if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-        return
-    delete_guess_user_data(interaction.guild.id, interaction.user.id)
-    set_guess_user_optout(interaction.guild.id, interaction.user.id, True)
-    await interaction.response.send_message("Deleted your Guess the User clues, scan metadata, and score. You are also opted out.", ephemeral=True)
-
-
-@guessuser_group.command(name="start", description="Start a Guess the User round")
-async def guessuser_start(interaction: discord.Interaction) -> None:
-    loaded_config = await asyncio.to_thread(get_config)
-    if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-        return
-    if not user_has_permission_for_interaction(interaction, loaded_config):
-        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
-        return
-    if not guess_user_enabled(interaction.guild.id, loaded_config):
-        await interaction.response.send_message("Guess the User is disabled here.", ephemeral=True)
-        return
-
-    module_config = get_module_config(loaded_config, "guess_user", interaction.guild.id)
-    cooldown_key = (interaction.guild.id, interaction.user.id)
-    now_ts = datetime.now().timestamp()
-    next_allowed = guess_user_cooldowns.get(cooldown_key, 0)
-    if now_ts < next_allowed:
-        await interaction.response.send_message(f"Try again in {int(next_allowed - now_ts)} seconds.", ephemeral=True)
-        return
-    guess_user_cooldowns[cooldown_key] = now_ts + int(module_config.get("cooldown_seconds", 30))
-
-    if active_clue_user_count(interaction.guild) < int(module_config.get("min_players", 3)):
-        await interaction.response.send_message("Not enough scanned, opted-in users have clues yet.", ephemeral=True)
-        return
-
-    clue = None
-    for _ in range(5):
-        candidate_clue = get_random_guess_clue(interaction.guild, loaded_config)
-        if not candidate_clue:
-            break
-        if await guild_has_member(interaction.guild, int(candidate_clue["user_id"])):
-            clue = candidate_clue
-            break
-        deactivate_guess_user(interaction.guild.id, int(candidate_clue["user_id"]))
-
-    if not clue:
-        await interaction.response.send_message("No available clues yet. An admin can run `/guessuser scan-server`.", ephemeral=True)
-        return
-
-    expires_at = datetime.now().astimezone() + timedelta(seconds=int(module_config.get("round_timeout_seconds", 60)))
-    active_guess_rounds[(interaction.guild.id, interaction.channel.id)] = {
-        "clue_id": clue["id"],
-        "answer_user_id": clue["user_id"],
-        "expires_at": expires_at,
-    }
     with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO guess_user_rounds (guild_id, channel_id, clue_id, answer_user_id, started_at, expires_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (interaction.guild.id, interaction.channel.id, clue["id"], clue["user_id"], now_iso(), expires_at.isoformat(), "active"),
+            "INSERT INTO reputation_title_profiles (guild_id, user_id, equipped_title) VALUES (?, ?, ?) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET equipped_title = excluded.equipped_title",
+            (interaction.guild.id, interaction.user.id, title),
         )
-
-    await interaction.response.send_message(f"Guess the User:\n\n**Clue:** {clue['clue']}\n\nUse `/guessuser guess user:@someone`.")
-
-    async def timeout_round() -> None:
-        await asyncio.sleep(int(module_config.get("round_timeout_seconds", 60)))
-        if (interaction.guild.id, interaction.channel.id) in active_guess_rounds:
-            await finish_guess_round(interaction.guild.id, interaction.channel.id)
-
-    asyncio.create_task(timeout_round())
+    await interaction.response.send_message(f"Equipped title: **{title}**", ephemeral=True)
 
 
-@guessuser_group.command(name="guess", description="Guess who the current clue describes")
-async def guessuser_guess(interaction: discord.Interaction, user: discord.Member) -> None:
-    if interaction.guild is None:
-        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
-        return
-
-    round_info = active_guess_rounds.get((interaction.guild.id, interaction.channel.id))
-    if not round_info:
-        await interaction.response.send_message("There is no active Guess the User round in this channel.", ephemeral=True)
-        return
-
-    if user.id == round_info["answer_user_id"]:
-        with get_db() as conn:
-            conn.execute(
-                "INSERT INTO guess_user_scores (guild_id, user_id, score) VALUES (?, ?, 1) ON CONFLICT(guild_id, user_id) DO UPDATE SET score = score + 1",
-                (interaction.guild.id, interaction.user.id),
-            )
-        await interaction.response.send_message("Correct!")
-        await finish_guess_round(interaction.guild.id, interaction.channel.id, winner_id=interaction.user.id)
-    else:
-        await interaction.response.send_message("Nope. Keep guessing.", ephemeral=True)
-
-
-@guessuser_group.command(name="leaderboard", description="Show Guess the User scores")
-async def guessuser_leaderboard(interaction: discord.Interaction) -> None:
+@titles_group.command(name="leaderboard", description="Show who has the most titles")
+async def titles_leaderboard(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT user_id, score FROM guess_user_scores WHERE guild_id = ? ORDER BY score DESC LIMIT 10",
+            "SELECT user_id, COUNT(*) AS count FROM reputation_title_user_titles WHERE guild_id = ? GROUP BY user_id ORDER BY count DESC LIMIT 10",
             (interaction.guild.id,),
         ).fetchall()
     if not rows:
-        await interaction.response.send_message("No scores yet.")
+        await interaction.response.send_message("No titles have been earned yet.")
         return
-    lines = [f"{index}. <@{row['user_id']}> - {row['score']}" for index, row in enumerate(rows, start=1)]
-    await interaction.response.send_message("\n".join(lines))
+    await interaction.response.send_message("\n".join(f"{i}. <@{row['user_id']}> - {row['count']} titles" for i, row in enumerate(rows, 1)))
 
 
-@guessuser_group.command(name="status", description="Show Guess the User status")
-async def guessuser_status(interaction: discord.Interaction) -> None:
-    loaded_config = await asyncio.to_thread(get_config)
+@titles_group.command(name="opt-out", description="Opt out of reputation title tracking")
+async def titles_opt_out(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
-    module_config = get_module_config(loaded_config, "guess_user", interaction.guild.id)
-    with get_db() as conn:
-        clue_count = conn.execute("SELECT COUNT(*) AS count FROM guess_user_clues WHERE guild_id = ? AND active = 1", (interaction.guild.id,)).fetchone()["count"]
-        optout_count = conn.execute("SELECT COUNT(*) AS count FROM guess_user_optouts WHERE guild_id = ?", (interaction.guild.id,)).fetchone()["count"]
+    set_reputation_optout(interaction.guild.id, interaction.user.id, True)
+    await interaction.response.send_message("You are opted out of reputation title tracking.", ephemeral=True)
+
+
+@titles_group.command(name="opt-in", description="Opt back into reputation title tracking")
+async def titles_opt_in(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    set_reputation_optout(interaction.guild.id, interaction.user.id, False)
+    await interaction.response.send_message("You are opted back into reputation title tracking.", ephemeral=True)
+
+
+@titles_group.command(name="grant", description="Admin grant a title")
+async def titles_grant(interaction: discord.Interaction, user: discord.Member, title: str) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not await require_admin_interaction(interaction, loaded_config):
+        return
+    granted = grant_reputation_title(interaction.guild.id, user.id, title, source="admin", granted_by=interaction.user.id)
+    await interaction.response.send_message(f"{'Granted' if granted else 'Already had'} **{title}** for {user.mention}.", ephemeral=True)
+
+
+@titles_group.command(name="remove", description="Admin remove a title")
+async def titles_remove(interaction: discord.Interaction, user: discord.Member, title: str) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not await require_admin_interaction(interaction, loaded_config):
+        return
+    remove_reputation_title(interaction.guild.id, user.id, title)
+    await interaction.response.send_message(f"Removed **{title}** from {user.mention}.", ephemeral=True)
+
+
+@titles_group.command(name="status", description="Show reputation title settings")
+async def titles_status(interaction: discord.Interaction) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not await require_admin_interaction(interaction, loaded_config):
+        return
+    module_config = get_module_config(loaded_config, "reputation_titles", interaction.guild.id)
     await interaction.response.send_message(
-        f"Enabled: `{bool(module_config.get('enabled', True))}`\nActive clues: `{clue_count}`\nOpted-out users: `{optout_count}`\nIgnored channels: `{len(module_config.get('ignored_channel_ids', []))}`",
+        f"Enabled: `{module_config.get('enabled', True)}`\n"
+        f"Track messages: `{module_config.get('track_messages', True)}`\n"
+        f"Track voice: `{module_config.get('track_voice', True)}`\n"
+        f"Track reactions: `{module_config.get('track_reactions', True)}`\n"
+        f"Spam cooldown: `{module_config.get('spam_cooldown_seconds', 60)}s`",
         ephemeral=True,
     )
 
 
-@guessuser_group.command(name="scan", description="Scan one user for safe clues")
-async def guessuser_scan(interaction: discord.Interaction, user: discord.Member) -> None:
+@titles_group.command(name="enable", description="Enable reputation title tracking")
+async def titles_enable(interaction: discord.Interaction) -> None:
     loaded_config = await asyncio.to_thread(get_config)
     if not await require_admin_interaction(interaction, loaded_config):
         return
-    module_config = get_module_config(loaded_config, "guess_user", interaction.guild.id)
-    if module_config.get("require_notice_before_scan", True) and not get_module_setting(interaction.guild.id, "guess_user", "notice_posted", False):
-        await interaction.response.send_message("Post the privacy notice first with `/guessuser post-notice`, or disable `require_notice_before_scan`.", ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    inserted, scanned = await scan_guess_user(interaction.guild, user, loaded_config, incremental=True)
-    await interaction.followup.send(f"Scanned {scanned} messages for {user.mention}; added {inserted} safe clues.", ephemeral=True)
+    set_module_setting(interaction.guild.id, "reputation_titles", "enabled", True)
+    await interaction.response.send_message("Reputation title tracking enabled.", ephemeral=True)
 
 
-@guessuser_group.command(name="rescan", description="Rescan one user from the full lookback window")
-async def guessuser_rescan(interaction: discord.Interaction, user: discord.Member) -> None:
+@titles_group.command(name="disable", description="Disable reputation title tracking")
+async def titles_disable(interaction: discord.Interaction) -> None:
     loaded_config = await asyncio.to_thread(get_config)
     if not await require_admin_interaction(interaction, loaded_config):
         return
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    inserted, scanned = await scan_guess_user(interaction.guild, user, loaded_config, incremental=False)
-    await interaction.followup.send(f"Rescanned {scanned} messages for {user.mention}; added {inserted} safe clues.", ephemeral=True)
+    set_module_setting(interaction.guild.id, "reputation_titles", "enabled", False)
+    await interaction.response.send_message("Reputation title tracking disabled.", ephemeral=True)
 
 
-@guessuser_group.command(name="scan-server", description="Scan recent public messages for safe user clues")
-async def guessuser_scan_server(interaction: discord.Interaction) -> None:
+async def run_party_vote(interaction: discord.Interaction, game: str, title: str, labels: list[str]) -> None:
     loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
+    if interaction.guild is None or not party_enabled(interaction.guild.id, loaded_config, game):
+        await interaction.response.send_message("That party game is disabled here.", ephemeral=True)
         return
-    module_config = get_module_config(loaded_config, "guess_user", interaction.guild.id)
-    if module_config.get("require_notice_before_scan", True) and not get_module_setting(interaction.guild.id, "guess_user", "notice_posted", False):
-        await interaction.response.send_message("Post the privacy notice first with `/guessuser post-notice`, or disable `require_notice_before_scan`.", ephemeral=True)
+    if cooldown := party_on_cooldown(interaction.guild.id, interaction.user.id, loaded_config):
+        await interaction.response.send_message(f"Try again in {cooldown} seconds.", ephemeral=True)
         return
-
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    users_seen: dict[int, Any] = {}
-    ignored_channel_ids = set(int(channel_id) for channel_id in module_config.get("ignored_channel_ids", []) or [])
-    since = datetime.now().astimezone() - timedelta(days=int(module_config.get("lookback_days", 90)))
-    readable_channels = 0
-    skipped_channels = 0
-    candidate_messages = 0
-
-    for channel in interaction.guild.text_channels:
-        if not is_public_server_text_channel(channel, ignored_channel_ids):
-            skipped_channels += 1
-            continue
-        readable_channels += 1
-        logging.info("Guess the User scan-server reading channel %s in guild %s", channel.id, interaction.guild.id)
-        try:
-            async for message in channel.history(after=since, limit=int(module_config.get("max_messages_per_channel", 1000)), oldest_first=False):
-                if message.author.bot and not module_config.get("include_bots", False):
-                    continue
-                if not message.content:
-                    continue
-                if not guess_user_is_opted_out(interaction.guild.id, message.author.id):
-                    users_seen[message.author.id] = message.author
-                    candidate_messages += 1
-        except (discord.Forbidden, discord.HTTPException):
-            logging.exception("Skipping channel during Guess the User server scan: %s", channel.id)
-        await asyncio.sleep(float(module_config.get("scan_delay_seconds", 0.5)))
-
-    total_inserted = 0
-    total_scanned = 0
-    for user in users_seen.values():
-        logging.info("Guess the User scan-server generating clues for user %s in guild %s", user.id, interaction.guild.id)
-        inserted, scanned = await scan_guess_user(interaction.guild, user, loaded_config, incremental=True)
-        total_inserted += inserted
-        total_scanned += scanned
-
-    await interaction.followup.send(
-        f"Scanned {len(users_seen)} users and {total_scanned} user messages; added {total_inserted} safe clues.\n"
-        f"Readable public channels: {readable_channels}. Skipped channels: {skipped_channels}. Candidate messages found: {candidate_messages}.",
-        ephemeral=True,
-    )
+    labels = [normalize_extracted_text(str(label))[:80] for label in labels if normalize_extracted_text(str(label)) and not SAFE_GAME_RE.search(str(label))]
+    if len(labels) < 2:
+        labels = ["Option A", "Option B"]
+    timeout = int(get_module_config(loaded_config, "party_games", interaction.guild.id).get("default_round_timeout_seconds", 60))
+    view = VoteView(labels, timeout=timeout)
+    embed = discord.Embed(title=title, description="\n".join(f"{i + 1}. {label}" for i, label in enumerate(labels)), color=discord.Color.blurple())
+    await interaction.response.send_message(embed=embed, view=view)
+    await view.wait()
+    results = view.results()
+    record_party_history(interaction.guild.id, interaction.channel.id, game, interaction.user.id, json_dumps(results))
+    add_party_score(interaction.guild.id, interaction.user.id, game, 1, 1)
+    await interaction.followup.send("Results: " + " | ".join(f"{labels[i]}: {count}" for i, count in enumerate(results)))
 
 
-@guessuser_group.command(name="wipe-user", description="Admin wipe of a user's Guess the User data")
-async def guessuser_wipe_user(interaction: discord.Interaction, user: discord.Member) -> None:
+@party_group.command(name="would-you-rather", description="Start a Would You Rather vote")
+async def party_would_you_rather(interaction: discord.Interaction) -> None:
     loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
-        return
-    delete_guess_user_data(interaction.guild.id, user.id)
-    await interaction.response.send_message(f"Deleted Guess the User data for {user.mention}.", ephemeral=True)
+    fallback = random.choice(STATIC_PROMPTS["would_you_rather"])
+    prompt = await safe_ai_game_prompt(interaction, "would_you_rather", loaded_config, {"options": list(fallback)})
+    labels = prompt.get("options", list(fallback)) if isinstance(prompt, dict) else list(fallback)
+    await run_party_vote(interaction, "would_you_rather", "Would You Rather?", labels[:2])
 
 
-@guessuser_group.command(name="ignore-channel", description="Exclude a channel from Guess the User scans")
-async def guessuser_ignore_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+@party_group.command(name="never-have-i-ever", description="Start a light Never Have I Ever prompt")
+async def party_never_have_i_ever(interaction: discord.Interaction) -> None:
     loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
-        return
-    set_ignored_channel(interaction.guild.id, "guess_user", channel.id, True)
-    await interaction.response.send_message(f"{channel.mention} will be ignored by Guess the User.", ephemeral=True)
+    fallback = random.choice(STATIC_PROMPTS["never_have_i_ever"])
+    prompt = await safe_ai_game_prompt(interaction, "never_have_i_ever", loaded_config, {"prompt": fallback})
+    statement = prompt.get("prompt", fallback) if isinstance(prompt, dict) else fallback
+    await run_party_vote(interaction, "never_have_i_ever", f"Never have I ever {statement}", ["I have", "I have not"])
 
 
-@guessuser_group.command(name="unignore-channel", description="Include a channel in Guess the User scans again")
-async def guessuser_unignore_channel(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+@party_group.command(name="this-or-that", description="Start a quick This or That vote")
+async def party_this_or_that(interaction: discord.Interaction) -> None:
     loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
-        return
-    set_ignored_channel(interaction.guild.id, "guess_user", channel.id, False)
-    await interaction.response.send_message(f"{channel.mention} can be scanned by Guess the User again.", ephemeral=True)
+    fallback = random.choice(STATIC_PROMPTS["this_or_that"])
+    prompt = await safe_ai_game_prompt(interaction, "this_or_that", loaded_config, {"options": list(fallback)})
+    labels = prompt.get("options", list(fallback)) if isinstance(prompt, dict) else list(fallback)
+    await run_party_vote(interaction, "this_or_that", "This or That?", labels[:2])
 
 
-@guessuser_group.command(name="post-notice", description="Post the Guess the User privacy notice")
-async def guessuser_post_notice(interaction: discord.Interaction) -> None:
+@party_group.command(name="trivia", description="Start a trivia question")
+async def party_trivia(interaction: discord.Interaction, category: str = "random", difficulty: str = "easy") -> None:
     loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
+    if interaction.guild is None or not party_enabled(interaction.guild.id, loaded_config, "trivia"):
+        await interaction.response.send_message("Trivia is disabled here.", ephemeral=True)
         return
-    notice = (
-        "**Guess the User privacy notice**\n"
-        "This server may use Guess the User, a party game that creates safe, vague clues from public server messages only. "
-        "It does not use DMs, private channels, mod-only channels, ignored channels, bots, deleted messages, or sensitive topics. "
-        "It stores generated clues and lightweight metadata, not raw message history. "
-        "Use `/guessuser opt-out` anytime, and `/guessuser delete-my-data` to remove your game data."
-    )
-    await interaction.channel.send(notice)
-    set_module_setting(interaction.guild.id, "guess_user", "notice_posted", True)
-    await interaction.response.send_message("Posted the Guess the User privacy notice.", ephemeral=True)
+    if cooldown := party_on_cooldown(interaction.guild.id, interaction.user.id, loaded_config):
+        await interaction.response.send_message(f"Try again in {cooldown} seconds.", ephemeral=True)
+        return
+    trivia = random.choice([item for item in STATIC_PROMPTS["trivia"] if category == "random" or item[0] == category] or STATIC_PROMPTS["trivia"])
+    _, _, question, answers, correct_index = trivia
+    timeout = int(get_module_config(loaded_config, "party_games", interaction.guild.id).get("default_round_timeout_seconds", 60))
+    view = TriviaView(interaction.guild.id, "trivia", answers, correct_index, timeout=timeout)
+    await interaction.response.send_message(embed=discord.Embed(title="Trivia", description=question), view=view)
+    record_party_history(interaction.guild.id, interaction.channel.id, "trivia", interaction.user.id, question)
 
 
-@guessuser_group.command(name="remove-clue", description="Disable a Guess the User clue by ID")
-async def guessuser_remove_clue(interaction: discord.Interaction, clue_id: int) -> None:
+@party_group.command(name="two-truths-start", description="Start Two Truths and a Lie")
+async def party_two_truths_start(interaction: discord.Interaction, statement_1: str, statement_2: str, statement_3: str, lie_number: int) -> None:
     loaded_config = await asyncio.to_thread(get_config)
-    if not await require_admin_interaction(interaction, loaded_config):
+    if interaction.guild is None or not party_enabled(interaction.guild.id, loaded_config, "two_truths_and_lie"):
+        await interaction.response.send_message("Two Truths and a Lie is disabled here.", ephemeral=True)
+        return
+    if lie_number not in (1, 2, 3):
+        await interaction.response.send_message("Lie number must be 1, 2, or 3.", ephemeral=True)
+        return
+    statements = [statement_1, statement_2, statement_3]
+    if any(SAFE_GAME_RE.search(statement) for statement in statements):
+        await interaction.response.send_message("Keep statements general-audience friendly.", ephemeral=True)
+        return
+    party_rounds[(interaction.guild.id, interaction.channel.id, "two_truths")] = {"lie": lie_number, "host": interaction.user.id}
+    await interaction.response.send_message("Two Truths and a Lie:\n" + "\n".join(f"{i + 1}. {statement}" for i, statement in enumerate(statements)) + "\nUse `/party two-truths-guess lie_number:<1-3>`.")
+
+
+@party_group.command(name="two-truths-guess", description="Guess the lie")
+async def party_two_truths_guess(interaction: discord.Interaction, lie_number: int) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = party_rounds.get((interaction.guild.id, interaction.channel.id, "two_truths"))
+    if not state:
+        await interaction.response.send_message("No active Two Truths round here.", ephemeral=True)
+        return
+    if lie_number == state["lie"]:
+        add_party_score(interaction.guild.id, interaction.user.id, "two_truths_and_lie", 1, 1)
+        await interaction.response.send_message("Correct!")
+    else:
+        await interaction.response.send_message("Nope.", ephemeral=True)
+
+
+@party_group.command(name="wordchain-start", description="Start a Word Chain game")
+async def party_wordchain_start(interaction: discord.Interaction, first_word: str) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if interaction.guild is None or not party_enabled(interaction.guild.id, loaded_config, "word_chain"):
+        await interaction.response.send_message("Word Chain is disabled here.", ephemeral=True)
+        return
+    word = re.sub(r"[^a-zA-Z]", "", first_word).lower()
+    if not word:
+        await interaction.response.send_message("Start with a word.", ephemeral=True)
+        return
+    party_rounds[(interaction.guild.id, interaction.channel.id, "word_chain")] = {"last": word, "used": {word}}
+    await interaction.response.send_message(f"Word Chain started with **{word}**. Next word must start with `{word[-1]}`. Use `/party wordchain word:<word>`.")
+
+
+@party_group.command(name="wordchain", description="Play a word in Word Chain")
+async def party_wordchain(interaction: discord.Interaction, word: str) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = party_rounds.get((interaction.guild.id, interaction.channel.id, "word_chain"))
+    if not state:
+        await interaction.response.send_message("No active Word Chain game here.", ephemeral=True)
+        return
+    cleaned = re.sub(r"[^a-zA-Z]", "", word).lower()
+    if not cleaned or cleaned in state["used"] or cleaned[0] != state["last"][-1]:
+        await interaction.response.send_message(f"Invalid word. It must start with `{state['last'][-1]}` and not be repeated.", ephemeral=True)
+        return
+    state["last"] = cleaned
+    state["used"].add(cleaned)
+    add_party_score(interaction.guild.id, interaction.user.id, "word_chain", 1, 1)
+    await interaction.response.send_message(f"Accepted: **{cleaned}**. Next starts with `{cleaned[-1]}`.")
+
+
+@party_group.command(name="guess-start", description="Start a yes/no guessing game")
+async def party_guess_start(interaction: discord.Interaction) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if interaction.guild is None or not party_enabled(interaction.guild.id, loaded_config, "guess"):
+        await interaction.response.send_message("Guess is disabled here.", ephemeral=True)
+        return
+    category, answer = random.choice(STATIC_PROMPTS["guess"])
+    party_rounds[(interaction.guild.id, interaction.channel.id, "guess")] = {"answer": answer.lower(), "display": answer, "questions": 0}
+    await interaction.response.send_message(f"I am thinking of a safe **{category}**. Use `/party guess-answer guess:<text>`.")
+
+
+@party_group.command(name="guess-answer", description="Make a guess in the Guess game")
+async def party_guess_answer(interaction: discord.Interaction, guess: str) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    state = party_rounds.get((interaction.guild.id, interaction.channel.id, "guess"))
+    if not state:
+        await interaction.response.send_message("No active Guess game here.", ephemeral=True)
+        return
+    if guess.lower().strip() == state["answer"]:
+        add_party_score(interaction.guild.id, interaction.user.id, "guess", 1, 1)
+        party_rounds.pop((interaction.guild.id, interaction.channel.id, "guess"), None)
+        await interaction.response.send_message(f"Correct! It was **{state['display']}**.")
+    else:
+        await interaction.response.send_message("Not it.", ephemeral=True)
+
+
+@party_group.command(name="leaderboard", description="Show party game leaderboard")
+async def party_leaderboard(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
         return
     with get_db() as conn:
-        conn.execute(
-            "UPDATE guess_user_clues SET active = 0 WHERE guild_id = ? AND id = ?",
-            (interaction.guild.id, clue_id),
-        )
-    await interaction.response.send_message(f"Disabled clue `{clue_id}`.", ephemeral=True)
+        rows = conn.execute(
+            "SELECT user_id, SUM(score) AS total FROM party_game_scores WHERE guild_id = ? GROUP BY user_id ORDER BY total DESC LIMIT 10",
+            (interaction.guild.id,),
+        ).fetchall()
+    await interaction.response.send_message("\n".join(f"{i}. <@{row['user_id']}> - {row['total']}" for i, row in enumerate(rows, 1)) or "No scores yet.")
+
+
+@party_group.command(name="stats", description="Show your party game stats")
+async def party_stats(interaction: discord.Interaction, user: Optional[discord.Member] = None) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    target = user or interaction.user
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT game, score, streak FROM party_game_scores WHERE guild_id = ? AND user_id = ? ORDER BY score DESC",
+            (interaction.guild.id, target.id),
+        ).fetchall()
+    await interaction.response.send_message("\n".join(f"{row['game']}: {row['score']} points, streak {row['streak']}" for row in rows) or "No stats yet.", ephemeral=user is None)
+
+
+@party_group.command(name="stop", description="Stop party games in this channel")
+async def party_stop(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    for key in list(party_rounds):
+        if key[0] == interaction.guild.id and key[1] == interaction.channel.id:
+            party_rounds.pop(key, None)
+    await interaction.response.send_message("Stopped active party games in this channel.")
+
+
+@party_group.command(name="status", description="Show party game module status")
+async def party_status(interaction: discord.Interaction) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not await require_admin_interaction(interaction, loaded_config):
+        return
+    module_config = get_module_config(loaded_config, "party_games", interaction.guild.id)
+    await interaction.response.send_message(f"Enabled: `{module_config.get('enabled', True)}`\nGames: `{module_config.get('enabled_games')}`", ephemeral=True)
+
+
+@party_group.command(name="enable", description="Enable a party game")
+async def party_enable(interaction: discord.Interaction, game: str) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not await require_admin_interaction(interaction, loaded_config):
+        return
+    enabled_games = dict(get_module_config(loaded_config, "party_games", interaction.guild.id).get("enabled_games") or {})
+    enabled_games[game] = True
+    set_module_setting(interaction.guild.id, "party_games", "enabled_games", enabled_games)
+    await interaction.response.send_message(f"Enabled `{game}`.", ephemeral=True)
+
+
+@party_group.command(name="disable", description="Disable a party game")
+async def party_disable(interaction: discord.Interaction, game: str) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not await require_admin_interaction(interaction, loaded_config):
+        return
+    enabled_games = dict(get_module_config(loaded_config, "party_games", interaction.guild.id).get("enabled_games") or {})
+    enabled_games[game] = False
+    set_module_setting(interaction.guild.id, "party_games", "enabled_games", enabled_games)
+    await interaction.response.send_message(f"Disabled `{game}`.", ephemeral=True)
+
+
+async def file_command_response(interaction: discord.Interaction, attachment: discord.Attachment, task: str, question: Optional[str] = None) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not user_has_permission_for_interaction(interaction, loaded_config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True, ephemeral=False)
+    try:
+        output = await run_attachment_brain(interaction, attachment, task, question)
+        await send_interaction_chunks(interaction, output, private=False)
+    except Exception as exc:
+        logging.exception("Attachment Brain failed")
+        await interaction.followup.send(f"Could not process that file: {exc}", ephemeral=True)
+
+
+@file_group.command(name="summarize", description="Summarize an uploaded file")
+async def file_summarize(interaction: discord.Interaction, attachment: discord.Attachment) -> None:
+    await file_command_response(interaction, attachment, "summarize")
+
+
+@file_group.command(name="ask", description="Ask a question about an uploaded file")
+async def file_ask(interaction: discord.Interaction, attachment: discord.Attachment, question: str) -> None:
+    await file_command_response(interaction, attachment, "ask", question)
+
+
+@file_group.command(name="extract-text", description="Extract readable text from a file")
+async def file_extract_text(interaction: discord.Interaction, attachment: discord.Attachment) -> None:
+    await file_command_response(interaction, attachment, "extract-text")
+
+
+@file_group.command(name="debug-log", description="Analyze a log file")
+async def file_debug_log(interaction: discord.Interaction, attachment: discord.Attachment) -> None:
+    await file_command_response(interaction, attachment, "debug-log")
+
+
+@file_group.command(name="explain-code", description="Explain a code file")
+async def file_explain_code(interaction: discord.Interaction, attachment: discord.Attachment) -> None:
+    await file_command_response(interaction, attachment, "explain-code")
+
+
+@file_group.command(name="convert-json", description="Convert or normalize file content to JSON")
+async def file_convert_json(interaction: discord.Interaction, attachment: discord.Attachment) -> None:
+    await file_command_response(interaction, attachment, "convert-json")
+
+
+@file_group.command(name="status", description="Show Attachment Brain settings")
+async def file_status(interaction: discord.Interaction) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not await require_admin_interaction(interaction, loaded_config):
+        return
+    module_config = get_module_config(loaded_config, "attachment_brain", interaction.guild.id if interaction.guild else None)
+    await interaction.response.send_message(
+        f"Enabled: `{module_config.get('enabled', True)}`\nMax file size: `{module_config.get('max_file_size_mb', 10)} MB`\nMax extracted chars: `{module_config.get('max_extracted_chars', 50000)}`",
+        ephemeral=True,
+    )
 
 
 discord_bot.tree.add_command(newspaper_group)
 discord_bot.tree.add_command(mediator_group)
-discord_bot.tree.add_command(guessuser_group)
+discord_bot.tree.add_command(titles_group)
+discord_bot.tree.add_command(party_group)
+discord_bot.tree.add_command(file_group)
 
 
 @discord.app_commands.allowed_installs(guilds=True, users=True)
@@ -2173,16 +2469,44 @@ def user_has_permission_for_message(new_msg: discord.Message, loaded_config: dic
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
     is_dm = new_msg.channel.type == discord.ChannelType.private
+    loaded_config = await asyncio.to_thread(get_config)
+
+    if not is_dm and not new_msg.author.bot:
+        await track_reputation_message(new_msg, loaded_config)
 
     if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
         return
-
-    loaded_config = await asyncio.to_thread(get_config)
 
     if not user_has_permission_for_message(new_msg, loaded_config):
         return
 
     await send_streaming_reply(new_msg, loaded_config)
+
+
+@discord_bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User | discord.Member) -> None:
+    if user.bot or reaction.message.guild is None or reaction.message.author.bot:
+        return
+    loaded_config = await asyncio.to_thread(get_config)
+    module_config = get_module_config(loaded_config, "reputation_titles", reaction.message.guild.id)
+    if not module_config.get("track_reactions", True):
+        return
+    if not is_public_server_text_channel(reaction.message.channel, set(int(id) for id in module_config.get("ignored_channel_ids", []) or [])):
+        return
+    await track_reputation_stat(reaction.message.guild.id, reaction.message.author.id, "reactions_received", loaded_config, cooldown_key=("reaction", reaction.message.id, user.id))
+    if str(reaction.emoji) in ("🙏", "👍", "💯", "✅"):
+        await track_reputation_stat(reaction.message.guild.id, reaction.message.author.id, "thanks_received", loaded_config, cooldown_key=("thanks", reaction.message.id, user.id))
+
+
+@discord_bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+    if member.bot or member.guild is None or before.channel == after.channel or after.channel is None:
+        return
+    loaded_config = await asyncio.to_thread(get_config)
+    module_config = get_module_config(loaded_config, "reputation_titles", member.guild.id)
+    if not module_config.get("track_voice", True):
+        return
+    await track_reputation_stat(member.guild.id, member.id, "voice_joins", loaded_config, cooldown_key=("voice",))
 
 
 async def main() -> None:

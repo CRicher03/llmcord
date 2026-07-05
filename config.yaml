@@ -32,22 +32,67 @@ modules:
     model:
     cooldown_seconds: 60
 
-  guess_user:
+  reputation_titles:
     enabled: true
-    mode: opt_out
-    round_timeout_seconds: 60
-    allow_reuse_clues: false
-    min_players: 3
-    cooldown_seconds: 30
-    lookback_days: 90
-    max_messages_per_user: 300
-    max_messages_per_channel: 1000
+    track_messages: true
+    track_voice: true
+    track_reactions: true
+    track_commands: true
     ignored_channel_ids: []
-    include_bots: false
-    require_notice_before_scan: true
-    store_raw_messages: false
-    clue_safety_filter: true
-    scan_delay_seconds: 0.5
+    spam_cooldown_seconds: 60
+    allow_user_opt_out: true
+
+  party_games:
+    enabled: true
+    cooldown_seconds: 20
+    default_round_timeout_seconds: 60
+    ai_generated_prompts: true
+    safe_mode: true
+    model:
+    enabled_games:
+      would_you_rather: true
+      never_have_i_ever: true
+      two_truths_and_lie: true
+      word_chain: true
+      trivia: true
+      guess: true
+      this_or_that: true
+
+  attachment_brain:
+    enabled: true
+    max_file_size_mb: 10
+    max_extracted_chars: 50000
+    chunk_size_chars: 12000
+    store_file_contents: false
+    allowed_extensions:
+      - txt
+      - md
+      - pdf
+      - docx
+      - csv
+      - json
+      - log
+      - py
+      - js
+      - ts
+      - html
+      - css
+      - lua
+      - java
+      - cs
+      - cpp
+      - c
+      - go
+      - rs
+      - yaml
+      - yml
+      - toml
+      - ini
+      - png
+      - jpg
+      - jpeg
+      - webp
+    vision_model:
     model:
 
 permissions:

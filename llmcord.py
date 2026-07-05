@@ -22,6 +22,7 @@ import httpx
 from openai import AsyncOpenAI
 from pypdf import PdfReader
 import yaml
+import yt_dlp
 
 load_dotenv()
 
@@ -43,6 +44,20 @@ SETTINGS_FILENAME = "channel_settings.json"
 URL_RE = re.compile(r"https?://[^\s<>()\]\}]+")
 
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+AUDIO_URL_RE = re.compile(r"https?://[^\s<>()\]\}]+")
+
+FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+FFMPEG_OPTIONS = "-vn"
+YTDLP_OPTIONS = {
+    "default_search": "auto",
+    "format": "bestaudio/best",
+    "ignoreerrors": True,
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+}
+DIRECT_AUDIO_SUFFIXES = (".aac", ".flac", ".m3u", ".m3u8", ".m4a", ".mp3", ".ogg", ".opus", ".pls", ".wav", ".weba", ".webm")
+DIRECT_AUDIO_CONTENT_TYPES = ("audio/", "video/", "application/ogg", "application/vnd.apple.mpegurl", "application/x-mpegurl")
 
 
 def parse_env_value(value: Optional[str]) -> Any:
@@ -142,6 +157,7 @@ curr_model = next(iter(config["models"]))
 channel_settings = load_channel_settings()
 
 msg_nodes = {}
+music_states = {}
 last_task_time = 0
 
 intents = discord.Intents.default()
@@ -167,6 +183,24 @@ class MsgNode:
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+
+@dataclass
+class Track:
+    request_url: str
+    stream_url: str
+    title: str
+    webpage_url: Optional[str] = None
+    requester_id: Optional[int] = None
+    duration: Optional[int] = None
+
+
+@dataclass
+class MusicState:
+    queue: list[Track] = field(default_factory=list)
+    current: Optional[Track] = None
+    voice_client: Optional[discord.VoiceClient] = None
+    text_channel: Optional[discord.abc.Messageable] = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def interaction_is_private(interaction: discord.Interaction) -> bool:
@@ -700,6 +734,245 @@ async def build_recent_channel_messages(channel: Any, loaded_config: dict[str, A
     return messages, user_warnings
 
 
+def get_music_state(guild_id: int) -> MusicState:
+    return music_states.setdefault(guild_id, MusicState())
+
+
+def format_duration(duration: Optional[int]) -> str:
+    if not duration:
+        return ""
+
+    minutes, seconds = divmod(int(duration), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f" ({hours}:{minutes:02d}:{seconds:02d})"
+    return f" ({minutes}:{seconds:02d})"
+
+
+def first_playable_entry(info: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if "entries" not in info:
+        return info
+
+    for entry in info.get("entries") or []:
+        if entry:
+            return entry
+    return None
+
+
+def stream_url_from_info(info: dict[str, Any]) -> Optional[str]:
+    if info.get("url"):
+        return info["url"]
+
+    for requested_download in info.get("requested_downloads") or []:
+        if requested_download.get("url"):
+            return requested_download["url"]
+
+    for requested_format in info.get("requested_formats") or []:
+        if requested_format.get("url"):
+            return requested_format["url"]
+
+    for media_format in reversed(info.get("formats") or []):
+        if media_format.get("url") and media_format.get("acodec") != "none":
+            return media_format["url"]
+
+    return None
+
+
+def extract_title_from_page(url: str) -> Optional[str]:
+    if not is_fetchable_url(url):
+        return None
+
+    response = httpx.get(url, follow_redirects=True, timeout=10, headers={"User-Agent": "llmcord/1.0"})
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    for selector in (
+        {"property": "og:title"},
+        {"name": "twitter:title"},
+    ):
+        if tag := soup.find("meta", attrs=selector):
+            if content := tag.get("content"):
+                return normalize_extracted_text(content)
+
+    if soup.title and soup.title.string:
+        return normalize_extracted_text(soup.title.string)
+
+    return None
+
+
+def is_direct_media_url(url: str) -> bool:
+    if not is_fetchable_url(url):
+        return False
+
+    parsed_url = urlparse(url)
+    if parsed_url.path.lower().endswith(DIRECT_AUDIO_SUFFIXES):
+        return True
+
+    try:
+        response = httpx.head(url, follow_redirects=True, timeout=10, headers={"User-Agent": "llmcord/1.0"})
+        content_type = response.headers.get("content-type", "").lower()
+        return any(content_type.startswith(prefix) for prefix in DIRECT_AUDIO_CONTENT_TYPES)
+    except Exception:
+        return False
+
+
+def extract_track(url: str, requester_id: int) -> Track:
+    last_error = None
+    info = None
+
+    with yt_dlp.YoutubeDL(YTDLP_OPTIONS) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            last_error = exc
+
+        entry = first_playable_entry(info) if info else None
+        stream_url = stream_url_from_info(entry) if entry else None
+
+        if not stream_url:
+            search_title = None
+            if entry:
+                search_title = " ".join(
+                    str(part)
+                    for part in (
+                        entry.get("artist"),
+                        entry.get("uploader"),
+                        entry.get("title"),
+                    )
+                    if part
+                ).strip()
+
+            if not search_title:
+                try:
+                    search_title = extract_title_from_page(url)
+                except Exception as exc:
+                    last_error = exc
+
+            if search_title:
+                search_info = ydl.extract_info(f"ytsearch1:{search_title}", download=False)
+                entry = first_playable_entry(search_info) if search_info else None
+                stream_url = stream_url_from_info(entry) if entry else None
+
+        if entry and stream_url:
+            title = entry.get("title") or entry.get("fulltitle") or url
+            return Track(
+                request_url=url,
+                stream_url=stream_url,
+                title=title,
+                webpage_url=entry.get("webpage_url") or entry.get("original_url") or url,
+                requester_id=requester_id,
+                duration=entry.get("duration"),
+            )
+
+    if is_direct_media_url(url):
+        return Track(request_url=url, stream_url=url, title=url, webpage_url=url, requester_id=requester_id)
+
+    raise RuntimeError(f"Could not resolve playable audio: {last_error}")
+
+
+async def resolve_track(url: str, requester_id: int) -> Track:
+    return await asyncio.to_thread(extract_track, url, requester_id)
+
+
+async def ensure_voice_client(interaction: discord.Interaction, state: MusicState) -> Optional[discord.VoiceClient]:
+    if interaction.guild is None:
+        await interaction.followup.send("Music playback only works in a server voice channel.", ephemeral=True)
+        return None
+
+    user_voice = getattr(interaction.user, "voice", None)
+    voice_channel = getattr(user_voice, "channel", None)
+    if voice_channel is None:
+        await interaction.followup.send("Join a voice channel first, then use `/play`.", ephemeral=True)
+        return None
+
+    voice_client = interaction.guild.voice_client
+    if voice_client and voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+    elif voice_client is None:
+        voice_client = await voice_channel.connect(self_deaf=True)
+
+    state.voice_client = voice_client
+    state.text_channel = interaction.channel
+    return voice_client
+
+
+async def play_next_track(guild_id: int) -> None:
+    state = get_music_state(guild_id)
+
+    async with state.lock:
+        voice_client = state.voice_client
+
+        if voice_client is None or not voice_client.is_connected():
+            state.current = None
+            return
+
+        if not state.queue:
+            state.current = None
+            text_channel = state.text_channel
+            state.voice_client = None
+            state.text_channel = None
+            should_disconnect = True
+            next_track = None
+        else:
+            next_track = state.queue.pop(0)
+            state.current = next_track
+            text_channel = state.text_channel
+            should_disconnect = False
+
+    if should_disconnect:
+        await voice_client.disconnect()
+        return
+
+    source = discord.FFmpegPCMAudio(next_track.stream_url, before_options=FFMPEG_BEFORE_OPTIONS, options=FFMPEG_OPTIONS)
+
+    def after_playback(error: Optional[Exception]) -> None:
+        if error:
+            logging.error("Audio playback error: %s", error)
+
+        future = asyncio.run_coroutine_threadsafe(play_next_track(guild_id), discord_bot.loop)
+
+        def log_queue_error(done_future: Any) -> None:
+            try:
+                exception = done_future.exception()
+            except Exception as exc:
+                logging.error("Error checking audio queue task: %s", exc)
+                return
+
+            if exception:
+                logging.error("Error advancing audio queue: %s", exception)
+
+        future.add_done_callback(log_queue_error)
+
+    voice_client.play(source, after=after_playback)
+
+    if text_channel:
+        await text_channel.send(f"Now playing: **{next_track.title}**{format_duration(next_track.duration)}")
+
+
+async def start_playback_if_idle(guild_id: int) -> None:
+    state = get_music_state(guild_id)
+    voice_client = state.voice_client
+
+    if voice_client and not voice_client.is_playing() and not voice_client.is_paused() and state.current is None:
+        await play_next_track(guild_id)
+
+
+def queue_summary(state: MusicState) -> str:
+    lines = []
+    if state.current:
+        lines.append(f"Now playing: **{state.current.title}**{format_duration(state.current.duration)}")
+
+    if state.queue:
+        lines.append("Up next:")
+        for index, track in enumerate(state.queue[:10], start=1):
+            lines.append(f"{index}. {track.title}{format_duration(track.duration)}")
+
+        if len(state.queue) > 10:
+            lines.append(f"...and {len(state.queue) - 10} more")
+
+    return "\n".join(lines) if lines else "The queue is empty."
+
+
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @discord_bot.tree.command(name="model", description="View or switch the current model")
@@ -935,12 +1208,183 @@ async def summarize_command(interaction: discord.Interaction, message_count: int
         await interaction.followup.send("Something went wrong while generating the summary. Check the Render logs.", ephemeral=True)
 
 
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord.app_commands.describe(url="A YouTube, Spotify, Apple Music, direct audio, or other media URL")
+@discord_bot.tree.command(name="play", description="Play audio from a URL in your voice channel")
+async def play_command(interaction: discord.Interaction, url: str) -> None:
+    global config
+
+    config = await asyncio.to_thread(get_config)
+
+    if not user_has_permission_for_interaction(interaction, config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    if interaction.guild is None:
+        await interaction.followup.send("Music playback only works in a server voice channel.", ephemeral=True)
+        return
+
+    url_match = AUDIO_URL_RE.search(url)
+    if not url_match:
+        await interaction.followup.send("Give me a URL to play.", ephemeral=True)
+        return
+
+    play_url = url_match.group(0).rstrip(".,;:!?\"'")
+    if not is_fetchable_url(play_url):
+        await interaction.followup.send("I won't fetch that URL.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    voice_client = await ensure_voice_client(interaction, state)
+    if voice_client is None:
+        return
+
+    try:
+        track = await resolve_track(play_url, interaction.user.id)
+    except Exception:
+        logging.exception("Error resolving audio URL")
+        await interaction.followup.send("I couldn't find playable audio for that URL.", ephemeral=True)
+        return
+
+    async with state.lock:
+        state.queue.append(track)
+        position = len(state.queue)
+
+    await interaction.followup.send(f"Queued: **{track.title}**{format_duration(track.duration)} (position {position})")
+    await start_playback_if_idle(interaction.guild.id)
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord_bot.tree.command(name="skip", description="Skip the current audio track")
+async def skip_command(interaction: discord.Interaction) -> None:
+    global config
+
+    config = await asyncio.to_thread(get_config)
+
+    if not user_has_permission_for_interaction(interaction, config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message("Music playback only works in a server voice channel.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    voice_client = state.voice_client or interaction.guild.voice_client
+
+    if voice_client is None or not (voice_client.is_playing() or voice_client.is_paused()):
+        await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        return
+
+    voice_client.stop()
+    await interaction.response.send_message("Skipped.")
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord_bot.tree.command(name="pause", description="Pause audio playback")
+async def pause_command(interaction: discord.Interaction) -> None:
+    global config
+
+    config = await asyncio.to_thread(get_config)
+
+    if not user_has_permission_for_interaction(interaction, config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+
+    voice_client = interaction.guild.voice_client if interaction.guild else None
+    if voice_client is None or not voice_client.is_playing():
+        await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        return
+
+    voice_client.pause()
+    await interaction.response.send_message("Paused.")
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord_bot.tree.command(name="resume", description="Resume paused audio playback")
+async def resume_command(interaction: discord.Interaction) -> None:
+    global config
+
+    config = await asyncio.to_thread(get_config)
+
+    if not user_has_permission_for_interaction(interaction, config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+
+    voice_client = interaction.guild.voice_client if interaction.guild else None
+    if voice_client is None or not voice_client.is_paused():
+        await interaction.response.send_message("Nothing is paused.", ephemeral=True)
+        return
+
+    voice_client.resume()
+    await interaction.response.send_message("Resumed.")
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord_bot.tree.command(name="stop", description="Stop audio playback and clear the queue")
+async def stop_command(interaction: discord.Interaction) -> None:
+    global config
+
+    config = await asyncio.to_thread(get_config)
+
+    if not user_has_permission_for_interaction(interaction, config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message("Music playback only works in a server voice channel.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    async with state.lock:
+        state.queue.clear()
+        state.current = None
+        voice_client = state.voice_client or interaction.guild.voice_client
+        state.voice_client = None
+        state.text_channel = None
+
+    if voice_client:
+        if voice_client.is_playing() or voice_client.is_paused():
+            voice_client.stop()
+        if voice_client.is_connected():
+            await voice_client.disconnect(force=True)
+
+    await interaction.response.send_message("Stopped and cleared the queue.")
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord_bot.tree.command(name="queue", description="Show the audio queue")
+async def queue_command(interaction: discord.Interaction) -> None:
+    global config
+
+    config = await asyncio.to_thread(get_config)
+
+    if not user_has_permission_for_interaction(interaction, config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message("Music playback only works in a server voice channel.", ephemeral=True)
+        return
+
+    state = get_music_state(interaction.guild.id)
+    await interaction.response.send_message(queue_summary(state))
+
+
 @discord_bot.event
 async def on_ready() -> None:
     if client_id := config.get("client_id"):
         logging.info(
             f"\n\nBOT SERVER INSTALL URL:\n"
-            f"https://discord.com/oauth2/authorize?client_id={client_id}&permissions=412317191168&scope=bot%20applications.commands\n\n"
+            f"https://discord.com/oauth2/authorize?client_id={client_id}&permissions=412320336896&scope=bot%20applications.commands\n\n"
             f"USER INSTALL URL FOR /ask IN DMS AND GROUP DMS:\n"
             f"https://discord.com/oauth2/authorize?client_id={client_id}&scope=applications.commands&integration_type=1\n"
         )

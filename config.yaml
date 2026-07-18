@@ -16,84 +16,19 @@ url_fetch_timeout: 10
 use_plain_responses: true
 allow_dms: true
 
-modules:
-  server_newspaper:
-    enabled: false
-    timezone: America/New_York
-    post_time: "00:00"
-    lookback_hours: 24
-    max_messages_per_channel: 150
-    max_total_messages: 800
-    ignored_channel_ids: []
-    model:
-
-  mediator:
-    enabled: true
-    model:
-    cooldown_seconds: 60
-
-  reputation_titles:
-    enabled: true
-    track_messages: true
-    track_voice: true
-    track_reactions: true
-    track_commands: true
-    ignored_channel_ids: []
-    spam_cooldown_seconds: 60
-    allow_user_opt_out: true
-
-  party_games:
-    enabled: true
-    cooldown_seconds: 20
-    default_round_timeout_seconds: 60
-    ai_generated_prompts: true
-    safe_mode: true
-    model:
-    enabled_games:
-      would_you_rather: true
-      never_have_i_ever: true
-      two_truths_and_lie: true
-      word_chain: true
-      trivia: true
-      guess: true
-      this_or_that: true
-
-  attachment_brain:
-    enabled: true
-    max_file_size_mb: 10
-    max_extracted_chars: 50000
-    chunk_size_chars: 12000
-    store_file_contents: false
-    allowed_extensions:
-      - txt
-      - md
-      - pdf
-      - docx
-      - csv
-      - json
-      - log
-      - py
-      - js
-      - ts
-      - html
-      - css
-      - lua
-      - java
-      - cs
-      - cpp
-      - c
-      - go
-      - rs
-      - yaml
-      - yml
-      - toml
-      - ini
-      - png
-      - jpg
-      - jpeg
-      - webp
-    vision_model:
-    model:
+# Image generation uses OpenRouter's dedicated image API. The first model is the default.
+image_models:
+  - openrouter/auto
+  - google/gemini-2.5-flash-image
+  - google/gemini-3.1-flash-image
+  - google/gemini-3.1-flash-lite-image
+  - bytedance-seed/seedream-4.5
+  - openai/gpt-image-2
+  - openai/gpt-5.4-image-2
+  - google/gemini-3-pro-image
+  - x-ai/grok-imagine-image-quality
+  - black-forest-labs/flux.2-pro
+  - black-forest-labs/flux.2-max
 
 permissions:
   users:
@@ -147,6 +82,12 @@ models:
   # -------------------------
 
   openrouter/openrouter/auto:
+    temperature: 0.7
+
+  openrouter/openrouter/auto-beta:
+    temperature: 0.7
+
+  openrouter/openrouter/auto-beta:online:
     temperature: 0.7
 
   openrouter/openrouter/auto:online:
@@ -222,6 +163,61 @@ models:
   # -------------------------
   # Top flagship models
   # -------------------------
+
+  # Newest verified releases (July 2026)
+  openrouter/openai/gpt-5.6-sol:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-sol:online:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-sol-pro:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-sol-pro:online:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-terra:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-terra:online:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-terra-pro:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-terra-pro:online:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-luna:
+    temperature: 0.7
+
+  openrouter/openai/gpt-5.6-luna:online:
+    temperature: 0.7
+
+  openrouter/x-ai/grok-4.5:
+    temperature: 0.7
+
+  openrouter/x-ai/grok-4.5:online:
+    temperature: 0.7
+
+  openrouter/moonshotai/kimi-k3:
+    temperature: 0.7
+
+  openrouter/moonshotai/kimi-k3:online:
+    temperature: 0.7
+
+  openrouter/meta/muse-spark-1.1:
+    temperature: 0.7
+
+  openrouter/meta/muse-spark-1.1:online:
+    temperature: 0.7
+
+  openrouter/thinkingmachines/inkling:
+    temperature: 0.7
+
+  openrouter/thinkingmachines/inkling:online:
+    temperature: 0.7
 
   openrouter/openai/gpt-5.5:
     temperature: 0.7
@@ -425,30 +421,6 @@ models:
 
   openrouter/nothingiisreal/mn-celeste-12b:online:
     temperature: 0.9
-
-personas:
-  concise: |
-    You are a direct Discord chatbot. Be useful, brief, and plainspoken.
-
-    Today's date is {date}. The current time is {time}.
-
-    User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
-
-  coding: |
-    You are a senior software engineering assistant in Discord. Be practical, precise, and willing to call out broken assumptions.
-    Prefer concrete steps, code-level reasoning, and concise explanations.
-
-    Today's date is {date}. The current time is {time}.
-
-    User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
-
-  roleplay: |
-    You are a vivid, improvisational Discord chatbot. Stay in character, keep momentum, and make scenes feel alive.
-    Respect the user's requested tone and avoid long exposition unless asked.
-
-    Today's date is {date}. The current time is {time}.
-
-    User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
 
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.

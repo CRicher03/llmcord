@@ -32,7 +32,8 @@ Additionally:
 ---
 
 ### Model switching with `/model`:
-![image](https://github.com/user-attachments/assets/568e2f5c-bf32-4b77-ab57-198d9120f3d2)
+
+Administrators can use `/model` to switch the model used by both app-command and mention/reply conversations. The selection lasts until the bot restarts.
 
 llmcord supports remote models from:
 - [OpenRouter](https://openrouter.ai/models)
@@ -50,23 +51,19 @@ Or run local models with:
 ---
 
 ### And more:
+- Supports user-installed `/ask` and `/image` app commands in DMs and group DMs
+- Image generation through OpenRouter with a curated model selector
+- Admin model switching with `/model`
 - Supports image attachments when using a vision model (like gpt-5, grok-4, claude-4, etc.)
 - Supports text, PDF, DOCX, and URL ingestion
 - Customizable personality (aka system prompt)
-- Per-channel model and persona overrides with `/channelmodel` and `/persona`
-- Regenerate or summarize conversations with `/retry` and `/summarize`
-- Daily AI-generated server newspaper with `/newspaper`
-- Neutral low-stakes disagreement mediation with `/mediate`
-- Reputation titles with `/titles`
-- General-audience party games with `/party`
-- Attachment/file Q&A with `/file`
 - Distinguishes users via their Discord IDs
 - Streamed responses (turns green when complete, automatically splits into separate messages when too long)
 - Hot reloading config (you can change settings without restarting the bot)
 - Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
 - Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
 - Fully asynchronous
-- Single-file bot with SQLite-backed social modules
+- Single-file bot
 
 ## Instructions
 
@@ -92,101 +89,16 @@ Or run local models with:
 | **max_messages** | The maximum number of messages allowed in a reply chain. When exceeded, the oldest messages are dropped.<br /><br />Default: `25` |
 | **use_plain_responses** | When set to `true` the bot will use plaintext responses instead of embeds. Plaintext responses have a shorter character limit so the bot's messages may split more often.<br /><br />Default: `false`<br /><br />**Also disables streamed responses and warning messages.** |
 | **allow_dms** | Set to `false` to disable direct message access.<br /><br />Default: `true` |
-| **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can change the model with `/model` and DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
+| **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can use `/model` and DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
 
 ### LLM settings:
 
 | Setting | Description |
 | --- | --- |
 | **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
-| **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
+| **models** | Add models in `<provider>/<model>: <parameters>` format (examples are included). The bot starts with the first model in the list; administrators can switch among configured models with `/model`.<br /><br />**Refer to the provider's documentation for supported parameters.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
+| **image_models** | OpenRouter image-generation model IDs offered by `/image`. The first entry is the default; users can select another configured model through autocomplete. |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
-
-### Social modules:
-
-These modules are configured under `modules:` in `config.yaml`. Per-server runtime settings are stored in `llmcord.sqlite3`.
-
-#### Daily Server Newspaper
-
-Generates a fun, general-audience summary of the last 24 hours of readable public server activity. It ignores private/mod-only channels, channels the bot cannot read, and configured ignored channels.
-
-Commands:
-- `/newspaper set-channel #channel`
-- `/newspaper enable`
-- `/newspaper disable`
-- `/newspaper generate`
-- `/newspaper ignore-channel #channel`
-- `/newspaper unignore-channel #channel`
-- `/newspaper status`
-
-By default it posts at `00:00` in `America/New_York`. Change `modules.server_newspaper.timezone` or `post_time` in `config.yaml`.
-
-#### AI Mediator
-
-Use `/mediate topic:<text> side_a:<optional> side_b:<optional>` for neutral summaries of low-stakes disagreements, planning conflicts, and decision-making. It adds a disclaimer for serious topics and refuses to mediate threats, self-harm, abuse, harassment, violence, or emergencies.
-
-Admin controls:
-- `/mediator enable`
-- `/mediator disable`
-- `/mediator status`
-
-#### Reputation Titles
-
-Tracks lightweight, non-sensitive public server activity and awards fun titles such as `Night Owl`, `Early Bird`, `Link Supplier`, `Helpful Human`, `Reaction Magnet`, `Voice Chat Regular`, `Game Goblin`, and `Server Regular`.
-
-It ignores DMs, private/mod-only channels, ignored channels, bots, and users who opt out. It stores counters and earned titles only, not raw message contents.
-
-Player commands:
-- `/titles profile`
-- `/titles list`
-- `/titles equip title:<title>`
-- `/titles leaderboard`
-- `/titles opt-out`
-- `/titles opt-in`
-
-Admin commands:
-- `/titles grant user:@user title:<title>`
-- `/titles remove user:@user title:<title>`
-- `/titles status`
-- `/titles enable`
-- `/titles disable`
-
-#### Party Game Pack
-
-Adds lightweight, general-audience games with per-server scores and history in SQLite. AI prompts are safe-filtered and fall back to static prompts if generation fails.
-
-Commands:
-- `/party would-you-rather`
-- `/party never-have-i-ever`
-- `/party this-or-that`
-- `/party trivia category:<category> difficulty:<difficulty>`
-- `/party two-truths-start statement_1:<text> statement_2:<text> statement_3:<text> lie_number:<1-3>`
-- `/party two-truths-guess lie_number:<1-3>`
-- `/party wordchain-start first_word:<word>`
-- `/party wordchain word:<word>`
-- `/party guess-start`
-- `/party guess-answer guess:<text>`
-- `/party leaderboard`
-- `/party stats`
-- `/party stop`
-- `/party status`
-- `/party enable game:<game>`
-- `/party disable game:<game>`
-
-#### Attachment Brain
-
-Lets users ask questions about uploaded files without storing file contents long-term. Supports common text/code/log files, PDFs, DOCX, JSON/CSV/Markdown, and images when a vision-capable model is configured.
-
-Commands:
-- `/file summarize attachment:<file>`
-- `/file ask attachment:<file> question:<text>`
-- `/file extract-text attachment:<file>`
-- `/file debug-log attachment:<file>`
-- `/file explain-code attachment:<file>`
-- `/file convert-json attachment:<file>`
-- `/file status`
-
-Configure limits with `modules.attachment_brain.max_file_size_mb`, `max_extracted_chars`, `allowed_extensions`, `model`, and `vision_model`.
 
 3. Run the bot:
 

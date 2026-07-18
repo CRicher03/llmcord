@@ -35,6 +35,8 @@ Additionally:
 
 Administrators can use `/model` to switch the model used by both app-command and mention/reply conversations. The selection lasts until the bot restarts.
 
+Administrators can similarly use `/imagemodel` to switch the default used by `/image`. An optional model supplied directly to `/image` overrides it for that request only.
+
 llmcord supports remote models from:
 - [OpenRouter](https://openrouter.ai/models)
 - [OpenAI](https://platform.openai.com/docs/models)
@@ -53,7 +55,7 @@ Or run local models with:
 ### And more:
 - Supports user-installed `/ask` and `/image` app commands in DMs and group DMs
 - Image generation through OpenRouter with a curated model selector
-- Admin model switching with `/model`
+- Admin model switching with `/model` and `/imagemodel`
 - Supports image attachments when using a vision model (like gpt-5, grok-4, claude-4, etc.)
 - Supports text, PDF, DOCX, and URL ingestion
 - Customizable personality (aka system prompt)
@@ -89,7 +91,7 @@ Or run local models with:
 | **max_messages** | The maximum number of messages allowed in a reply chain. When exceeded, the oldest messages are dropped.<br /><br />Default: `25` |
 | **use_plain_responses** | When set to `true` the bot will use plaintext responses instead of embeds. Plaintext responses have a shorter character limit so the bot's messages may split more often.<br /><br />Default: `false`<br /><br />**Also disables streamed responses and warning messages.** |
 | **allow_dms** | Set to `false` to disable direct message access.<br /><br />Default: `true` |
-| **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can use `/model` and DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
+| **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can use `/model` and `/imagemodel`, and can DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
 
 ### LLM settings:
 
@@ -97,7 +99,7 @@ Or run local models with:
 | --- | --- |
 | **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
 | **models** | Add models in `<provider>/<model>: <parameters>` format (examples are included). The bot starts with the first model in the list; administrators can switch among configured models with `/model`.<br /><br />**Refer to the provider's documentation for supported parameters.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
-| **image_models** | OpenRouter image-generation model IDs offered by `/image`. The first entry is the default; users can select another configured model through autocomplete. |
+| **image_models** | OpenRouter image-generation model IDs offered by `/image` and `/imagemodel`. The first entry is the startup default. `/imagemodel` changes it until restart, while `/image` can select a one-off override. |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
 
 3. Run the bot:

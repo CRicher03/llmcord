@@ -79,6 +79,7 @@ def get_effective_model(channel: Any, loaded_config: dict[str, Any]) -> str:
 
 config = get_config()
 curr_model = next(iter(config["models"]))
+curr_image_model = (config.get("image_models") or ["openrouter/auto"])[0]
 
 msg_nodes = {}
 last_task_time = 0
@@ -639,10 +640,54 @@ async def model_autocomplete(interaction: discord.Interaction, current: str) -> 
 
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@discord.app_commands.describe(prompt="Describe the image you want", model="OpenRouter image model (defaults to auto)")
+@discord_bot.tree.command(name="imagemodel", description="View or switch the default image model")
+async def image_model_command(interaction: discord.Interaction, model: str) -> None:
+    global config, curr_image_model
+
+    config = await asyncio.to_thread(get_config)
+
+    if not is_admin_user(interaction.user.id, config):
+        await interaction.response.send_message("You don't have permission to change the image model.", ephemeral=True)
+        return
+
+    image_models = config.get("image_models") or ["openrouter/auto"]
+    if model not in image_models:
+        await interaction.response.send_message("That image model is not in `config.yaml`.", ephemeral=True)
+        return
+
+    if model == curr_image_model:
+        output = f"Current image model: `{curr_image_model}`"
+    else:
+        curr_image_model = model
+        output = f"Image model switched to: `{curr_image_model}`"
+        logging.info(output)
+
+    await interaction.response.send_message(output, ephemeral=interaction.guild is None)
+
+
+@image_model_command.autocomplete("model")
+async def image_model_command_autocomplete(interaction: discord.Interaction, current: str) -> list[Choice[str]]:
+    loaded_config = await asyncio.to_thread(get_config)
+    search = current.casefold()
+    matching_models = [
+        model
+        for model in (loaded_config.get("image_models") or ["openrouter/auto"])
+        if search in model.casefold()
+    ]
+    matching_models.sort(key=lambda model: model != curr_image_model)
+
+    return [
+        Choice(name=f"{model} (current)" if model == curr_image_model else model, value=model)
+        for model in matching_models[:25]
+    ]
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@discord.app_commands.describe(prompt="Describe the image you want", model="Optional one-off image model override")
 @discord_bot.tree.command(name="image", description="Generate an image with OpenRouter")
 async def image_command(interaction: discord.Interaction, prompt: str, model: Optional[str] = None) -> None:
-    global config
+    global config, curr_image_model
 
     config = await asyncio.to_thread(get_config)
 
@@ -651,7 +696,9 @@ async def image_command(interaction: discord.Interaction, prompt: str, model: Op
         return
 
     image_models = config.get("image_models") or ["openrouter/auto"]
-    selected_model = model or image_models[0]
+    if curr_image_model not in image_models:
+        curr_image_model = image_models[0]
+    selected_model = model or curr_image_model
     if selected_model not in image_models:
         await interaction.response.send_message("That image model is not in `config.yaml`.", ephemeral=True)
         return

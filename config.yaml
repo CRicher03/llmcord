@@ -23,6 +23,8 @@ allow_dms: true
 request_cooldown_seconds: 3 # Set to 0 to disable the cooldown
 max_concurrent_requests: 4
 request_timeout_seconds: 600
+response_buttons: true
+long_answer_threshold: 6000 # Characters; set to 0 to keep all answers inline
 
 # Optional persistent channel defaults; threads inherit their parent channel's model.
 # Use a model key from the models section below.

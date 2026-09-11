@@ -38,6 +38,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             "max_concurrent_requests": 4,
             "system_prompt": "Original system prompt",
             "use_plain_responses": False,
+            "response_buttons": False,
         }
         self.config["permissions"]["users"]["admin_ids"] = [999]
         for name, value in [("active_requests", {}), ("recent_requests", {}), ("request_cooldowns", {}),

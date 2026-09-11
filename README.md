@@ -57,6 +57,16 @@ Selection order is the current channel's command override, its configured defaul
 | `/stop` | Stop your own active generation in this channel, including chat, `/ask`, `/image`, and retries. Already posted partial replies remain and are marked interrupted when using embeds. |
 | `/retry` | Retry your latest accepted request in this channel. Optional `model:` selects another configured text or image model for this retry only. |
 | `/status` | Privately show the effective models, conversation/file limits, active request count, and available commands. |
+| `/compare prompt:... model_a:... model_b:...` | Ask two different configured text models the same prompt and show labeled answers. Supports `private:true`. |
+| `/summarize message:...` | Summarize the reply chain ending at a message ID or Discord message link from the current channel. Supports `private:true`. |
+
+Comparisons make two model calls, one after the other, within one admitted request so they respect the shared concurrency limit. Each model gets the same prepared input; neither sees the other's answer. If one fails, the other answer is still delivered alongside a readable error. `/retry` repeats both models; its optional model override replaces the first model.
+
+Summaries cover key points, decisions, and open questions, using the existing conversation-length and input limits. They are text-only, require access to message history, and exclude messages outside the current channel (including a thread's parent channel). Truncation or unreadable-input warnings appear with the summary. A retry reuses the prepared transcript.
+
+Generations show a small controls message with **Stop**, **Retry**, and **Download** buttons. Only the original requester may use them, and current bot permissions are checked. Stop affects that specific generation; Retry uses that response's input even if you have since asked another question. Download sends a private UTF-8 `answer.md` file containing the text response. Retry and Download become available after generation finishes, where applicable. Controls expire after 15 minutes or a bot restart; `/retry` remains available while its retry record exists. Set `response_buttons: false` to disable buttons.
+
+Answers longer than `long_answer_threshold` (default: 6,000 characters) are delivered as a short preview plus a complete Markdown attachment for app commands and plain chat replies. Embed replies keep streaming and receive a Markdown attachment on completion. Files preserve code blocks and Unicode. If the file exceeds Discord's upload limit, answers remain split into messages; set the threshold to `0` to keep answers inline. Private responses and their files stay private. Image responses already contain their downloadable image; their text Download button stays disabled.
 
 Retries preserve the original prepared conversation, including attachment content, without adding the previous generated answer. A mention/reply retry creates a new branch from the original message. Private `/ask` retries stay private. If a request failed before its input was prepared, retry attempts preparation again. Retry records are kept in memory, with one latest request per user/channel, up to 50 records total, and are available for up to 30 minutes; restarting clears them. Image retries generate a new image from the same prompt.
 
@@ -150,7 +160,7 @@ Context downloads only access public HTTP(S) destinations, validating DNS and ea
 
 ## Notes
 
-- Run offline regression checks with `python -m unittest -v test_llmcord test_features` after installing the requirements. Tests do not log into Discord or call model providers.
+- Run offline regression checks with `python -m unittest -v test_llmcord test_features test_response_tools` after installing the requirements. Tests do not log into Discord or call model providers.
 - Restart the bot after updating the code so its existing startup command sync registers the new slash commands. Command model overrides and retry history reset on restart; `channel_models` configuration persists.
 
 - If you're having issues, try my suggestions [here](https://github.com/jakobdylanc/llmcord/issues/19)

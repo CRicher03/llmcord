@@ -30,7 +30,26 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s",
 )
 
-VISION_MODEL_TAGS = ("chat-latest", "claude", "gemini", "gemma", "gpt-4", "gpt-5", "gpt-latest", "grok-4", "inkling", "kimi", "llama", "muse", "vision", "vl")
+VISION_MODEL_TAGS = (
+    "chat-latest",
+    "claude",
+    "deepseek-v4.1",
+    "gemini",
+    "gemma",
+    "glm-5.3-flash",
+    "gpt-4",
+    "gpt-5",
+    "gpt-6",
+    "gpt-latest",
+    "grok-4",
+    "inkling",
+    "kimi",
+    "llama",
+    "muse",
+    "qwen3.8-max",
+    "vision",
+    "vl",
+)
 
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()

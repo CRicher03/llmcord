@@ -8,3 +8,7 @@ services:
         required: false
     volumes:
       - ./:/app:ro
+      - bot-data:/app/data
+
+volumes:
+  bot-data:

@@ -33,11 +33,13 @@ Additionally:
 
 ### Model switching with `/model`:
 
-Administrators can use `/model` to switch the model used by both app-command and mention/reply conversations. The selection lasts until the bot restarts.
+Administrators can use `/model` to switch the model used by both app-command and mention/reply conversations. Model selections can optionally survive restarts (enabled in the supplied configuration).
 
 Administrators can similarly use `/imagemodel` to switch the default used by `/image`. An optional model supplied directly to `/image` overrides it for that request only.
 
-Use `/channelmodel model:...` to set a text model for the current server channel or thread. Threads inherit their parent channel's model unless they have their own default. `/channelmodel` shows the effective model, and `/channelmodel reset:true` removes the temporary override. These commands are admin-only; `/model` still changes the global fallback.
+Use `/channelmodel model:...` to set a text model for the current server channel or thread. Threads inherit their parent channel's model unless they have their own default. `/channelmodel` shows the effective model, and `/channelmodel reset:true` removes the command override. These commands are admin-only; `/model` still changes the global fallback.
+
+`persist_model_selections: true` saves `/model`, `/imagemodel`, and channel command overrides in `model_state_file` (default: `data/model-selections.json`). Writes replace the file atomically; only model names and channel IDs are saved, never prompts or API keys. Removed models and unreadable state fall back to configured defaults. A save failure leaves the selection active for this session and is reported to the administrator. Set the option to `false` for session-only selections. The supplied Docker Compose file mounts a named volume at `/app/data`; other hosts need writable persistent storage at the configured path. State is restored at startup, so changing the persistence option or state path takes full effect on the next restart.
 
 For defaults that survive restart, add channel IDs and existing model keys to `channel_models` in `config.yaml`, for example:
 
@@ -57,6 +59,7 @@ Selection order is the current channel's command override, its configured defaul
 | `/stop` | Stop your own active generation in this channel, including chat, `/ask`, `/image`, and retries. Already posted partial replies remain and are marked interrupted when using embeds. |
 | `/retry` | Retry your latest accepted request in this channel. Optional `model:` selects another configured text or image model for this retry only. |
 | `/status` | Privately show the effective models, conversation/file limits, active request count, and available commands. |
+| `/help` | Privately show a compact guide to reply chains, attachments, model selection, and private responses, with command examples. |
 | `/compare prompt:... model_a:... model_b:...` | Ask two different configured text models the same prompt and show labeled answers. Supports `private:true`. |
 | `/summarize message:...` | Summarize the reply chain ending at a message ID or Discord message link from the current channel. Supports `private:true`. |
 
@@ -64,7 +67,9 @@ Comparisons make two model calls, one after the other, within one admitted reque
 
 Summaries cover key points, decisions, and open questions, using the existing conversation-length and input limits. They are text-only, require access to message history, and exclude messages outside the current channel (including a thread's parent channel). Truncation or unreadable-input warnings appear with the summary. A retry reuses the prepared transcript.
 
-Generations show a small controls message with **Stop**, **Retry**, and **Download** buttons. Only the original requester may use them, and current bot permissions are checked. Stop affects that specific generation; Retry uses that response's input even if you have since asked another question. Download sends a private UTF-8 `answer.md` file containing the text response. Retry and Download become available after generation finishes, where applicable. Controls expire after 15 minutes or a bot restart; `/retry` remains available while its retry record exists. Set `response_buttons: false` to disable buttons.
+Generations show a temporary progress message with **Stop**, **Retry**, and **Download** buttons. Progress reports stages such as reading attachments, reading the conversation, generating an image, or comparing model 1 of 2. On completion, controls move to the last answer or file message and the progress message is removed, where Discord permits these edits. The answer footer shows the model and elapsed time. Only the original requester may use the controls, and current bot permissions are checked. Stop affects that specific generation; Retry uses that response's input even if you have since asked another question. Download sends a private UTF-8 `answer.md` file containing the text response. Retry and Download become available after generation finishes, where applicable. Controls expire after 15 minutes or a bot restart; expiry disables buttons without replacing the answer. Set `response_buttons: false` to disable buttons and progress messages; model/time footers remain.
+
+Inline responses balance standard backtick and tilde code fences across message boundaries, reopening the language block in continuation messages. Temporary closing fences also keep streamed code readable. Downloaded files and cached model context preserve the original text without these display-only markers. Edits to user message text or attachments invalidate cached context, including edits to messages outside Discord's own message cache. Future conversations fetch the corrected message; an in-progress request or retry keeps its already prepared input snapshot.
 
 Answers longer than `long_answer_threshold` (default: 6,000 characters) are delivered as a short preview plus a complete Markdown attachment for app commands and plain chat replies. Embed replies keep streaming and receive a Markdown attachment on completion. Files preserve code blocks and Unicode. If the file exceeds Discord's upload limit, answers remain split into messages; set the threshold to `0` to keep answers inline. Private responses and their files stay private. Image responses already contain their downloadable image; their text Download button stays disabled.
 
@@ -142,7 +147,7 @@ Context downloads only access public HTTP(S) destinations, validating DNS and ea
 | --- | --- |
 | **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
 | **models** | Add models in `<provider>/<model>: <parameters>` format (examples are included). The bot starts with the first model in the list; administrators can switch among configured models with `/model`.<br /><br />**Refer to the provider's documentation for supported parameters.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
-| **image_models** | OpenRouter image-generation model IDs offered by `/image` and `/imagemodel`. The first entry is the startup default. `/imagemodel` changes it until restart, while `/image` can select a one-off override. |
+| **image_models** | OpenRouter image-generation model IDs offered by `/image` and `/imagemodel`. The first entry is the startup default when no valid saved selection exists. `/imagemodel` changes the default; `/image` can select a one-off override. |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
 
 3. Run the bot:
@@ -160,8 +165,8 @@ Context downloads only access public HTTP(S) destinations, validating DNS and ea
 
 ## Notes
 
-- Run offline regression checks with `python -m unittest -v test_llmcord test_features test_response_tools` after installing the requirements. Tests do not log into Discord or call model providers.
-- Restart the bot after updating the code so its existing startup command sync registers the new slash commands. Command model overrides and retry history reset on restart; `channel_models` configuration persists.
+- Run offline regression checks with `python -m unittest -v test_llmcord test_features test_response_tools test_polish` after installing the requirements. Tests do not log into Discord or call model providers.
+- Restart the bot after updating the code so its startup command sync registers new slash commands. Retry history resets on restart; command model overrides survive when persistence is enabled and storage is retained. `channel_models` configuration always persists.
 
 - If you're having issues, try my suggestions [here](https://github.com/jakobdylanc/llmcord/issues/19)
 

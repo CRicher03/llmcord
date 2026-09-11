@@ -7,6 +7,8 @@ import io
 import ipaddress
 import logging
 import os
+from pathlib import Path
+import tempfile
 import json
 import re
 import socket
@@ -111,6 +113,8 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
         raise ValueError("long_answer_threshold must be a nonnegative integer")
     if not isinstance(loaded_config.get("response_buttons", True), bool):
         raise ValueError("response_buttons must be true or false")
+    if not isinstance(loaded_config.get("persist_model_selections", False), bool):
+        raise ValueError("persist_model_selections must be true or false")
     return loaded_config
 
 
@@ -141,6 +145,55 @@ curr_image_model = (config.get("image_models") or ["openrouter/auto"])[0]
 msg_nodes = {}
 last_task_time = 0
 channel_models: dict[int, str] = {}
+edited_message_ids: dict[int, None] = {}
+
+
+def restore_model_selections(loaded_config: dict[str, Any]) -> None:
+    global curr_model, curr_image_model
+    if not loaded_config.get("persist_model_selections", False):
+        return
+    try:
+        state = json.loads(Path(loaded_config.get("model_state_file", "data/model-selections.json")).read_text(encoding="utf-8"))
+        text_model, image_model = state.get("model"), state.get("image_model")
+        saved_channels = state.get("channel_models", {})
+        if not isinstance(saved_channels, dict) or not isinstance(text_model, str) or not isinstance(image_model, str):
+            raise ValueError("Invalid saved model selections")
+        valid_channels = {int(key): value for key, value in saved_channels.items() if str(key).isdigit() and isinstance(value, str) and value in loaded_config["models"]}
+        if text_model in loaded_config["models"]:
+            curr_model = text_model
+        if image_model in (loaded_config.get("image_models") or ["openrouter/auto"]):
+            curr_image_model = image_model
+        channel_models.update(valid_channels)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, AttributeError):
+        logging.exception("Could not restore model selections; using configured defaults")
+
+
+def save_model_selections(loaded_config: dict[str, Any]) -> str:
+    if not loaded_config.get("persist_model_selections", False):
+        return " Selections last until restart."
+    temporary = None
+    try:
+        target = Path(loaded_config.get("model_state_file", "data/model-selections.json"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as file:
+            temporary = file.name
+            json.dump({"model": curr_model, "image_model": curr_image_model, "channel_models": channel_models}, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        return " Saved for the next restart."
+    except OSError:
+        logging.exception("Could not save model selections")
+        return " Changed for this session, but saving failed; check the bot's writable storage."
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 @dataclass
@@ -159,6 +212,11 @@ class GenerationRequest:
     second_model: Optional[str] = None
     output: str = ""
     source_message_id: Optional[int] = None
+    controls: Any = None
+    answer_message: Any = None
+    answer_embed: Optional[discord.Embed] = None
+    answer_content: Optional[str] = None
+    started_at: float = field(default_factory=time.monotonic)
 
 
 active_requests: dict[int, tuple[int, asyncio.Task]] = {}
@@ -634,6 +692,7 @@ async def prepare_ask_request(request: GenerationRequest, loaded_config: dict[st
     text = request.prompt
     images = []
     if attachment := request.attachment:
+        await update_progress(request, "Reading attachment…")
         kind = get_attachment_kind(attachment)
         if kind is None:
             raise UserFacingError("Unsupported attachment. Upload an image, text file, PDF, or DOCX.")
@@ -649,6 +708,8 @@ async def prepare_ask_request(request: GenerationRequest, loaded_config: dict[st
                 text += "\n" + await extract_attachment_text(attachment, response, kind, loaded_config)
         except ValueError as error:
             raise UserFacingError("This attachment could not be read or exceeds the document limits. Try a smaller or different file.") from error
+    if URL_RE.search(request.prompt):
+        await update_progress(request, "Reading linked pages…")
     url_texts, failed = await extract_url_texts(request.prompt, loaded_config)
     if failed:
         request.warnings.add("Some URLs could not be read.")
@@ -667,6 +728,8 @@ async def generate_nonstream_response(prompt: str, user_id: int, loaded_config: 
     if request.attachment and get_attachment_kind(request.attachment) == "image" and not model_accepts_images(provider_slash_model):
         raise UserFacingError("This model isn't configured for images. Use `/retry model:` with a vision model, or ask an administrator to select one.")
     await prepare_ask_request(request, loaded_config)
+    if request.kind != "compare":
+        await update_progress(request, "Writing summary…" if request.kind == "summarize" else "Generating answer…")
     client_and_kwargs = build_openai_client_and_kwargs(loaded_config, provider_slash_model, messages_for_model(request.messages, provider_slash_model), stream=False)
     client = client_and_kwargs["client"]
     try:
@@ -678,11 +741,51 @@ async def generate_nonstream_response(prompt: str, user_id: int, loaded_config: 
         await client.close()
 
 
-async def send_interaction_chunks(interaction: discord.Interaction, content: str, private: bool) -> None:
-    max_len = 1900
-    chunks = [content[i:i + max_len] for i in range(0, len(content), max_len)] or ["*(empty response)*"]
-    for chunk in chunks:
-        await interaction.followup.send(chunk, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+def markdown_parts(text: str, limit: int) -> list[tuple[str, str]]:
+    """Return exact source slices and independently balanced display slices."""
+    if limit < 512:
+        raise ValueError("Markdown message limit must be at least 512 characters")
+    budget = limit - 256
+    events = []
+    opened = None
+    for match in re.finditer(r"(?m)^ {0,3}(`{3,64}|~{3,64})([^\n]*)(?:\n|$)", text):
+        marker, info = match[1], match[2]
+        if opened is None and len(info) <= 100:
+            opened = (marker, marker + info + "\n")
+        elif opened and marker[0] == opened[0][0] and len(marker) >= len(opened[0]) and not info.strip():
+            opened = None
+        else:
+            continue
+        events.append((match.start(), match.end(), opened))
+    result, start, state, event_index = [], 0, None, 0
+    while start < len(text):
+        end = min(len(text), start + budget)
+        if end < len(text):
+            newline = text.rfind("\n", start, end)
+            if newline >= start + budget // 2:
+                end = newline + 1
+            for event_start, event_end, _ in events[event_index:]:
+                if event_start >= end:
+                    break
+                if event_start < end < event_end:
+                    end = event_start if event_start > start else event_end
+                    break
+        prefix = state[1] if state else ""
+        while event_index < len(events) and events[event_index][1] <= end:
+            state = events[event_index][2]
+            event_index += 1
+        raw = text[start:end]
+        suffix = ("" if raw.endswith("\n") else "\n") + state[0] if state else ""
+        result.append((raw, prefix + raw + suffix))
+        start = end
+    return result
+
+
+async def send_interaction_chunks(interaction: discord.Interaction, content: str, private: bool, request: Optional[GenerationRequest] = None) -> None:
+    for raw, chunk in markdown_parts(content, 1700) or [("", "*(empty response)*")]:
+        message = await interaction.followup.send(chunk, ephemeral=private, allowed_mentions=discord.AllowedMentions.none(), wait=True)
+        if request is not None:
+            request.answer_message, request.answer_content = message, chunk
 
 
 def answer_file(content: str) -> discord.File:
@@ -693,13 +796,28 @@ async def publish_answer(interaction: discord.Interaction, request: GenerationRe
     request.output = content
     threshold = loaded_config.get("long_answer_threshold", 6000)
     if threshold > 0 and len(content) > threshold and len(content.encode("utf-8")) <= interaction.filesize_limit:
-        await interaction.followup.send(content[:1500] + "\n\nFull answer attached as Markdown.", file=answer_file(content), ephemeral=request.private, allowed_mentions=discord.AllowedMentions.none())
+        preview = markdown_parts(content, 1400)[0][1] + "\n\nFull answer attached as Markdown."
+        request.answer_message = await interaction.followup.send(preview, file=answer_file(content), ephemeral=request.private, allowed_mentions=discord.AllowedMentions.none(), wait=True)
+        request.answer_content = preview
     else:
-        await send_interaction_chunks(interaction, content, request.private)
+        await send_interaction_chunks(interaction, content, request.private, request=request)
 
 
 def copy_for_retry(request: GenerationRequest, model: Optional[str] = None) -> GenerationRequest:
-    return replace(request, model=model or request.model, messages=deepcopy(request.messages), warnings=request.warnings.copy(), created_at=time.monotonic(), output="")
+    return replace(request, model=model or request.model, messages=deepcopy(request.messages), warnings=request.warnings.copy(), created_at=time.monotonic(), started_at=time.monotonic(), output="", controls=None, answer_message=None, answer_embed=None, answer_content=None)
+
+
+def response_footer(request: GenerationRequest) -> str:
+    models = request.model + (f" / {request.second_model}" if request.second_model else "")
+    return f"{models[:220]} · {max(0, time.monotonic() - request.started_at):.1f}s"
+
+
+async def update_progress(request: Optional[GenerationRequest], text: str) -> None:
+    if request is not None and request.controls and request.controls.message:
+        try:
+            await request.controls.message.edit(content=text)
+        except discord.HTTPException:
+            logging.debug("Could not update progress message")
 
 
 class ResponseControls(View):
@@ -756,28 +874,44 @@ class ResponseControls(View):
             item.disabled = True
         if self.message:
             try:
-                await self.message.edit(content="Controls expired. Use `/retry` for your latest request.", view=self)
+                await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
 
 
 async def with_response_controls(request: GenerationRequest, loaded_config: dict[str, Any], operation: Callable[[], Awaitable[None]], send: Callable[..., Awaitable[Any]]) -> None:
-    if not loaded_config.get("response_buttons", True):
-        await operation()
-        return
-    controls = ResponseControls(request)
+    controls = ResponseControls(request) if loaded_config.get("response_buttons", True) else None
+    request.controls = controls
+    request.started_at = time.monotonic()
+    progress_message = None
     try:
-        controls.message = await send("Generating…", view=controls)
+        if controls:
+            controls.message = progress_message = await send("Preparing request…", view=controls)
         await operation()
     finally:
-        controls.stop_generation.disabled = True
-        controls.retry_response.disabled = False
-        controls.download_response.disabled = not bool(request.output)
-        if controls.message:
-            try:
-                await controls.message.edit(content="Response controls", view=controls)
-            except discord.HTTPException:
-                logging.exception("Couldn't update response controls")
+        if controls:
+            controls.stop_generation.disabled = True
+            controls.retry_response.disabled = False
+            controls.download_response.disabled = not bool(request.output)
+        try:
+            if request.answer_message:
+                kwargs = {"view": controls} if controls else {}
+                if request.answer_embed:
+                    embed = request.answer_embed.copy()
+                    prior = embed.footer.text or ""
+                    embed.set_footer(text=(prior + " · " if prior else "") + response_footer(request))
+                    kwargs["embed"] = embed
+                elif request.answer_content is not None:
+                    kwargs["content"] = request.answer_content + "\n-# " + response_footer(request)
+                await request.answer_message.edit(**kwargs)
+                if controls:
+                    controls.message = request.answer_message
+                if progress_message and progress_message is not request.answer_message:
+                    await progress_message.delete()
+            elif progress_message:
+                await progress_message.edit(content=response_footer(request), view=controls)
+        except discord.HTTPException:
+            logging.exception("Couldn't finalize response controls")
 
 
 async def generate_openrouter_image(prompt: str, model: str, loaded_config: dict[str, Any]) -> tuple[bytes, str]:
@@ -844,6 +978,18 @@ async def build_reply_chain_messages(start_msg: discord.Message, loaded_config: 
         curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
 
         async with curr_node.lock:
+            if curr_msg.id in edited_message_ids:
+                edited_message_ids.pop(curr_msg.id, None)
+                try:
+                    curr_msg = await curr_msg.channel.fetch_message(curr_msg.id)
+                except (Exception, asyncio.CancelledError):
+                    edited_message_ids[curr_msg.id] = None
+                    raise
+                curr_node.text = None
+                curr_node.images = []
+                curr_node.parent_msg = None
+                curr_node.attachment_warnings.clear()
+                curr_node.has_bad_attachments = curr_node.has_bad_links = curr_node.fetch_parent_failed = False
             if curr_node.text == None:
                 await populate_msg_node(curr_msg, curr_node, loaded_config)
                 await set_parent_msg(curr_msg, curr_node)
@@ -877,6 +1023,7 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
     if request is not None and request.messages is not None:
         messages, user_warnings = deepcopy(request.messages), request.warnings.copy()
     else:
+        await update_progress(request, "Reading conversation and attachments…")
         messages, user_warnings = await build_reply_chain_messages(start_msg, loaded_config, accept_images=True)
         append_system_prompt(messages, loaded_config)
         messages.reverse()
@@ -891,9 +1038,10 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
     finish_reason = None
     response_msgs = []
     response_contents = []
+    display_contents = []
 
     if use_plain_responses := loaded_config.get("use_plain_responses", False):
-        max_message_length = 4000
+        max_message_length = 1700 if request is not None else 4000
     else:
         max_message_length = 4096 - len(STREAMING_INDICATOR)
         embed = discord.Embed.from_dict(dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)]))
@@ -902,6 +1050,10 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
         reply_target = start_msg if not response_msgs else response_msgs[-1]
         response_msg = await reply_target.reply(**reply_kwargs)
         response_msgs.append(response_msg)
+        if request is not None:
+            request.answer_message = response_msg
+            request.answer_embed = reply_kwargs.get("embed").copy() if reply_kwargs.get("embed") else None
+            request.answer_content = reply_kwargs.get("content")
 
         msg_nodes[response_msg.id] = MsgNode(parent_msg=start_msg)
         await msg_nodes[response_msg.id].lock.acquire()
@@ -911,10 +1063,10 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
         if use_plain_responses or not response_contents:
             return
         start_next_msg = len(response_msgs) < len(response_contents)
-        full = len(response_contents[-1]) == max_message_length
+        full = len(response_contents) < len(display_contents)
         time_delta = datetime.now().timestamp() - last_task_time
         if start_next_msg or time_delta >= EDIT_DELAY_SECONDS or full or final:
-            embed.description = response_contents[-1] + ("" if full or final else STREAMING_INDICATOR)
+            embed.description = display_contents[len(response_contents) - 1] + ("" if full or final else STREAMING_INDICATOR)
             good_finish = finish_reason is not None and finish_reason.lower() in ("stop", "end_turn")
             embed.color = EMBED_COLOR_COMPLETE if (full and not final) or good_finish else EMBED_COLOR_INCOMPLETE
             if start_next_msg:
@@ -922,12 +1074,15 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
             else:
                 await asyncio.sleep(max(0, EDIT_DELAY_SECONDS - time_delta))
                 await response_msgs[-1].edit(embed=embed)
+            if request is not None:
+                request.answer_embed = embed.copy()
             last_task_time = datetime.now().timestamp()
 
     if use_plain_responses and user_warnings:
         await start_msg.reply("\n".join(sorted(user_warnings))[:1900], allowed_mentions=discord.AllowedMentions.none())
     client_and_kwargs = build_openai_client_and_kwargs(loaded_config, provider_slash_model, messages, stream=True)
     openai_client, openai_kwargs = client_and_kwargs["client"], client_and_kwargs["kwargs"]
+    await update_progress(request, "Generating answer…")
     try:
         async with start_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
@@ -940,25 +1095,30 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
                 finish_reason = choice.finish_reason
 
                 remaining = choice.delta.content or ""
-                while remaining:
-                    if not response_contents or len(response_contents[-1]) == max_message_length:
-                        response_contents.append("")
-                    available = max_message_length - len(response_contents[-1])
-                    response_contents[-1] += remaining[:available]
-                    remaining = remaining[available:]
-                    await update_embed(final=finish_reason is not None and not remaining)
+                if remaining and use_plain_responses:
+                    response_contents.append(remaining)
+                elif remaining:
+                    parts = markdown_parts("".join(response_contents) + remaining, max_message_length)
+                    display_contents = [part[1] for part in parts]
+                    for index in range(max(0, len(response_msgs) - 1), len(parts)):
+                        response_contents = [part[0] for part in parts[:index + 1]]
+                        await update_embed(final=finish_reason is not None and index == len(parts) - 1)
                 if finish_reason is not None and not choice.delta.content:
                     await update_embed(final=True)
 
             if use_plain_responses:
                 full_answer = "".join(response_contents)
+                display_contents = [display for raw, display in markdown_parts(full_answer, max_message_length)]
                 threshold = loaded_config.get("long_answer_threshold", 6000)
                 file_limit = getattr(getattr(start_msg, "guild", None), "filesize_limit", 10 * 1024 * 1024)
                 if request is not None and threshold > 0 and len(full_answer) > threshold and len(full_answer.encode("utf-8")) <= file_limit:
-                    await reply_helper(content=full_answer[:1500] + "\n\nFull answer attached as Markdown.", file=answer_file(full_answer), allowed_mentions=discord.AllowedMentions.none())
+                    await reply_helper(content=markdown_parts(full_answer, 1400)[0][1] + "\n\nFull answer attached as Markdown.", file=answer_file(full_answer), allowed_mentions=discord.AllowedMentions.none())
                 else:
-                    for content in response_contents:
-                        await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+                    for content in display_contents:
+                        if request is not None:
+                            await reply_helper(content=content, allowed_mentions=discord.AllowedMentions.none())
+                        else:
+                            await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
             elif finish_reason is None:
                 await update_embed(final=True)
             if not response_contents and request is not None:
@@ -967,9 +1127,11 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
     except (Exception, asyncio.CancelledError):
         if not use_plain_responses and response_msgs:
             # Finalize the visible partial answer before releasing its history lock.
-            embed.description = response_contents[len(response_msgs) - 1]
+            embed.description = display_contents[len(response_msgs) - 1]
             embed.color = EMBED_COLOR_INCOMPLETE
             embed.set_footer(text="Generation interrupted")
+            if request is not None:
+                request.answer_embed = embed.copy()
             try:
                 await response_msgs[-1].edit(embed=embed)
             except discord.HTTPException:
@@ -989,6 +1151,7 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
         if threshold > 0 and len(request.output) > threshold and len(request.output.encode("utf-8")) <= file_limit:
             file_message = await start_msg.reply("Full answer as Markdown:", file=answer_file(request.output), allowed_mentions=discord.AllowedMentions.none())
             msg_nodes[file_message.id] = MsgNode(text=request.output, parent_msg=start_msg)
+            request.answer_message, request.answer_content, request.answer_embed = file_message, "Full answer as Markdown:", None
 
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
@@ -1019,6 +1182,7 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
         output = f"Model switched to: `{curr_model}`"
         logging.info(output)
 
+    output += save_model_selections(config)
     await interaction.response.send_message(output, ephemeral=interaction.guild is None)
 
 
@@ -1061,6 +1225,7 @@ async def image_model_command(interaction: discord.Interaction, model: str) -> N
         output = f"Image model switched to: `{curr_image_model}`"
         logging.info(output)
 
+    output += save_model_selections(config)
     await interaction.response.send_message(output, ephemeral=interaction.guild is None)
 
 
@@ -1164,6 +1329,7 @@ async def prepare_summary(interaction: discord.Interaction, request: GenerationR
         raise UserFacingError("You need permission to view this channel and read its message history.")
     if request.messages is not None:
         return
+    await update_progress(request, "Reading reply chain…")
     source = await interaction.channel.fetch_message(request.source_message_id)
     messages, warnings = await build_reply_chain_messages(source, loaded_config, accept_images=False, same_channel_only=True)
     request.warnings.update(warnings)
@@ -1203,20 +1369,23 @@ async def run_interaction_request(interaction: discord.Interaction, request: Gen
             await send_streaming_reply(request.start_msg, loaded_config, log_label="Retry", request=request)
             await notify("Retried your request as a new reply to the original message.")
         elif request.kind == "image":
+            await update_progress(request, "Generating image…")
             image_bytes, media_type = await generate_openrouter_image(request.prompt, request.model, loaded_config)
             if len(image_bytes) > interaction.filesize_limit:
                 raise UserFacingError("The generated image exceeds Discord's upload limit. Try a smaller image or another model.")
             extension = {"image/jpeg": "jpg", "image/svg+xml": "svg", "image/webp": "webp"}.get(media_type, "png")
             quoted_prompt = "\n".join(f"> {line}" if line else ">" for line in request.prompt[:1500].splitlines())[:1700]
-            await interaction.followup.send(
-                content=f"**Prompt**\n{quoted_prompt}\n\n**Model:** `{request.model}`",
+            request.answer_content = f"**Prompt**\n{quoted_prompt}"
+            request.answer_message = await interaction.followup.send(
+                content=request.answer_content,
                 file=discord.File(io.BytesIO(image_bytes), filename=f"generated-image.{extension}"),
-                ephemeral=private, allowed_mentions=discord.AllowedMentions.none(),
+                ephemeral=private, allowed_mentions=discord.AllowedMentions.none(), wait=True,
             )
         elif request.kind == "compare":
             await prepare_ask_request(request, loaded_config)
             sections = [f"**Prompt**\n{request.prompt}"]
-            for model in (request.model, request.second_model):
+            for index, model in enumerate((request.model, request.second_model), 1):
+                await update_progress(request, f"Comparing model {index} of 2: {model}")
                 try:
                     answer = await generate_nonstream_response(request.prompt, request.user_id, loaded_config, model, request=request)
                 except Exception as error:
@@ -1233,7 +1402,7 @@ async def run_interaction_request(interaction: discord.Interaction, request: Gen
             response = await generate_nonstream_response(request.prompt, request.user_id, loaded_config, request.model, request=request)
             quoted_prompt = "\n".join(f"> {line}" if line else ">" for line in request.prompt.splitlines())
             warnings = "\n".join(sorted(request.warnings))
-            output = f"**Prompt**\n{quoted_prompt}\n\n**Model:** `{request.model}`\n\n"
+            output = f"**Prompt**\n{quoted_prompt}\n\n"
             if warnings:
                 output += f"{warnings}\n\n"
             output += f"**Response**\n{response}"
@@ -1315,7 +1484,8 @@ async def channel_model_command(interaction: discord.Interaction, model: Optiona
     elif model:
         channel_models[interaction.channel_id] = model
     selected = get_effective_model(interaction.channel, loaded_config)
-    await interaction.response.send_message(f"This channel uses `{selected}`. Command overrides last until restart; `channel_models` in config sets persistent defaults.", ephemeral=True)
+    saved = save_model_selections(loaded_config) if model or reset else ""
+    await interaction.response.send_message(f"This channel uses `{selected}`.{saved}", ephemeral=True)
 
 
 channel_model_command.autocomplete("model")(model_autocomplete)
@@ -1331,7 +1501,7 @@ async def status_command(interaction: discord.Interaction) -> None:
         return
     image_models = loaded_config.get("image_models") or ["openrouter/auto"]
     image_model = curr_image_model if curr_image_model in image_models else image_models[0]
-    commands_text = "`/ask` (attachment/private), `/compare`, `/summarize`, `/image`, `/retry` (model), `/stop`, `/status`"
+    commands_text = "`/help`, `/ask` (attachment/private), `/compare`, `/summarize`, `/image`, `/retry` (model), `/stop`, `/status`"
     if is_admin_user(interaction.user.id, loaded_config):
         commands_text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel`"
     output = (
@@ -1343,6 +1513,35 @@ async def status_command(interaction: discord.Interaction) -> None:
         f"**Commands:** {commands_text}"
     )
     await interaction.response.send_message(output, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@discord_bot.tree.command(name="help", description="Quick examples for conversations, files, models, and privacy")
+async def help_command(interaction: discord.Interaction) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not user_has_permission_for_interaction(interaction, loaded_config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+    text = (
+        "**Quick start**\n"
+        "Mention me to start a conversation. Reply to my answer to continue or branch it. "
+        "In DMs, conversations continue automatically; mention me to start fresh.\n\n"
+        "**Examples**\n"
+        "• `/ask prompt:Explain this code private:true` — a private answer; optionally add `attachment:`.\n"
+        "• `/compare prompt:Explain recursion model_a:… model_b:…` — select two models from autocomplete.\n"
+        "• `/summarize message:<link or ID>` — summarize a reply chain in this channel.\n"
+        "• `/image prompt:A tiny astronaut tending a garden` — generate an image.\n\n"
+        "**Controls**\n"
+        "Stop cancels your generation. Retry repeats that answer's input; `/retry model:…` changes the model for your latest request. "
+        "Download saves Markdown. Long answers can arrive as files.\n\n"
+        "**Models and privacy**\n"
+        "`/status` shows this channel's model and limits. Private answers, retries, and files stay private. "
+        "Model overrides on retries don't change the channel default."
+    )
+    if is_admin_user(interaction.user.id, loaded_config):
+        text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel` select defaults."
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @discord_bot.tree.error
@@ -1397,6 +1596,21 @@ def user_has_permission_for_message(new_msg: discord.Message, loaded_config: dic
 
 
 @discord_bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    if not any(key in payload.data for key in ("content", "attachments")):
+        return
+    author_id = payload.data.get("author", {}).get("id")
+    if discord_bot.user and str(author_id) == str(discord_bot.user.id):
+        return
+    node = msg_nodes.get(payload.message_id)
+    if node is not None and node.role == "assistant" and node.text is not None:
+        return
+    edited_message_ids[payload.message_id] = None
+    while len(edited_message_ids) > MAX_MESSAGE_NODES:
+        edited_message_ids.pop(next(iter(edited_message_ids)))
+
+
+@discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
     is_dm = new_msg.channel.type == discord.ChannelType.private
 
@@ -1419,6 +1633,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
 
 async def main() -> None:
+    restore_model_selections(config)
     await discord_bot.start(config["bot_token"])
 
 

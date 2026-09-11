@@ -1,6 +1,7 @@
 ﻿import asyncio
 from base64 import b64decode, b64encode
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import io
 import ipaddress
@@ -9,8 +10,9 @@ import os
 import json
 import re
 import socket
+import time
 from zipfile import ZipFile
-from typing import Any, Literal, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 from bs4 import BeautifulSoup
 import discord
@@ -20,7 +22,7 @@ from discord.ui import LayoutView, TextDisplay
 from docx import Document
 from dotenv import load_dotenv
 import httpx
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 from pypdf import PdfReader
 import yaml
 
@@ -84,7 +86,7 @@ def parse_env_value(value: Optional[str]) -> Any:
 
 def resolve_env(node: Any) -> Any:
     if isinstance(node, dict):
-        return {key.removesuffix("_env"): parse_env_value(os.environ.get(value)) if key.endswith("_env") else resolve_env(value) for key, value in node.items()}
+        return {key.removesuffix("_env") if isinstance(key, str) else key: parse_env_value(os.environ.get(value)) if isinstance(key, str) and key.endswith("_env") else resolve_env(value) for key, value in node.items()}
     return node
 
 
@@ -96,6 +98,14 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
         settings = permissions.setdefault(category, {})
         for key in ("allowed_ids", "blocked_ids", "admin_ids") if category == "users" else ("allowed_ids", "blocked_ids"):
             settings[key] = normalize_permission_ids(settings.get(key))
+    for key, default, minimum in (("max_concurrent_requests", 4, 1), ("request_cooldown_seconds", 3, 0), ("request_timeout_seconds", 600, 1)):
+        value = loaded_config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum or value != value or value == float("inf"):
+            raise ValueError(f"{key} must be a finite number >= {minimum}")
+        if key == "max_concurrent_requests" and not isinstance(value, int):
+            raise ValueError("max_concurrent_requests must be an integer")
+    if not isinstance(loaded_config.get("channel_models") or {}, dict):
+        raise ValueError("channel_models must map channel IDs to configured model names")
     return loaded_config
 
 
@@ -111,7 +121,12 @@ def normalize_permission_ids(value: Any) -> list[int]:
 
 
 def get_effective_model(channel: Any, loaded_config: dict[str, Any]) -> str:
-    return curr_model
+    configured = loaded_config.get("channel_models") or {}
+    for channel_id in (getattr(channel, "id", None), getattr(channel, "parent_id", None)):
+        for selected in (channel_models.get(channel_id), configured.get(str(channel_id)), configured.get(channel_id)):
+            if selected in loaded_config["models"]:
+                return selected
+    return curr_model if curr_model in loaded_config["models"] else next(iter(loaded_config["models"]))
 
 
 config = get_config()
@@ -120,6 +135,105 @@ curr_image_model = (config.get("image_models") or ["openrouter/auto"])[0]
 
 msg_nodes = {}
 last_task_time = 0
+channel_models: dict[int, str] = {}
+
+
+@dataclass
+class GenerationRequest:
+    user_id: int
+    channel_id: int
+    kind: Literal["ask", "message", "image"]
+    model: str
+    prompt: str
+    private: bool = False
+    attachment: Optional[discord.Attachment] = None
+    start_msg: Optional[discord.Message] = None
+    messages: Optional[list[dict[str, Any]]] = None
+    warnings: set[str] = field(default_factory=set)
+    created_at: float = field(default_factory=time.monotonic)
+
+
+active_requests: dict[int, tuple[int, asyncio.Task]] = {}
+request_cooldowns: dict[int, float] = {}
+recent_requests: dict[tuple[int, int], GenerationRequest] = {}
+MAX_RECENT_REQUESTS = 50
+RETRY_TTL_SECONDS = 1800
+
+
+class UserFacingError(Exception):
+    """A controlled, safe explanation that can be shown directly to a user."""
+
+
+def friendly_error(error: Exception) -> str:
+    if isinstance(error, UserFacingError):
+        return str(error)
+    if isinstance(error, (TimeoutError, httpx.TimeoutException, APITimeoutError)):
+        return "The request timed out. Try `/retry`, or choose a faster model."
+    if isinstance(error, (httpx.ConnectError, APIConnectionError)):
+        return "I couldn't reach the model or download server. Please try again shortly."
+    status = getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
+    if status == 429:
+        return "The service is rate-limiting requests. Wait a little before trying `/retry`."
+    if status in (401, 403):
+        return "Access was denied. An administrator should check the provider credentials and bot permissions."
+    if status == 402:
+        return "The provider has insufficient credits. An administrator needs to check its balance."
+    if status == 404:
+        return "The selected model or requested file is unavailable. Try another model or upload the file again."
+    if status == 413:
+        return "This request or file is too large. Try a smaller attachment or a shorter conversation."
+    if status in (400, 422):
+        return "The service rejected this request. Try a shorter conversation or a model that supports this input."
+    if status and status >= 500:
+        return "The service is temporarily unavailable. Try `/retry` shortly or choose another model."
+    return "Something went wrong. Try `/retry`; if it keeps happening, ask an administrator to check the bot logs."
+
+
+def prune_recent_requests() -> None:
+    cutoff = time.monotonic() - RETRY_TTL_SECONDS
+    for key, request in list(recent_requests.items()):
+        if request.created_at < cutoff:
+            recent_requests.pop(key, None)
+    while len(recent_requests) > MAX_RECENT_REQUESTS:
+        recent_requests.pop(next(iter(recent_requests)))
+
+
+async def run_generation(request: GenerationRequest, loaded_config: dict[str, Any], operation: Callable[[], Awaitable[None]], notify: Callable[[str], Awaitable[Any]]) -> bool:
+    """Admission and registration have no awaits, so concurrent callbacks cannot overbook."""
+    now = time.monotonic()
+    for user_id, expires in list(request_cooldowns.items()):
+        if expires <= now:
+            request_cooldowns.pop(user_id, None)
+    rejection = None
+    if request.user_id in active_requests:
+        rejection = "You already have a generation running. Use `/stop` in its channel first."
+    elif len(active_requests) >= loaded_config.get("max_concurrent_requests", 4):
+        rejection = "The bot is busy. Please try again when a running request finishes."
+    elif request.user_id in request_cooldowns:
+        wait = max(1, int(request_cooldowns[request.user_id] - now + 0.999))
+        rejection = f"Please wait {wait} seconds before starting another generation."
+    if rejection:
+        await notify(rejection)
+        return False
+
+    active_requests[request.user_id] = (request.channel_id, asyncio.current_task())
+    request_cooldowns[request.user_id] = now + max(0, loaded_config.get("request_cooldown_seconds", 3))
+    key = (request.user_id, request.channel_id)
+    recent_requests.pop(key, None)
+    recent_requests[key] = request
+    prune_recent_requests()
+    try:
+        async with asyncio.timeout(loaded_config.get("request_timeout_seconds", 600)):
+            await operation()
+        return True
+    except asyncio.CancelledError:
+        await notify("Generation stopped. You can use `/retry` to try again.")
+    except Exception as error:
+        logging.exception("Generation failed (%s, user ID: %s)", request.kind, request.user_id)
+        await notify(friendly_error(error))
+    finally:
+        active_requests.pop(request.user_id, None)
+    return False
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -139,6 +253,7 @@ class MsgNode:
 
     has_bad_attachments: bool = False
     has_bad_links: bool = False
+    attachment_warnings: set[str] = field(default_factory=set)
     fetch_parent_failed: bool = False
 
     parent_msg: Optional[discord.Message] = None
@@ -411,6 +526,8 @@ async def populate_msg_node(curr_msg: discord.Message, curr_node: MsgNode, loade
             image_count += 1
         if kind is None or (kind == "image" and image_count > loaded_config.get("max_images", 5)) or attachment.size > loaded_config.get("max_download_bytes", 20 * 1024 * 1024):
             bad_attachment_count += 1
+            if attachment.size > loaded_config.get("max_download_bytes", 20 * 1024 * 1024):
+                curr_node.attachment_warnings.add("Warning: An attachment exceeds max_download_bytes; use a smaller file")
             continue
 
         try:
@@ -421,9 +538,11 @@ async def populate_msg_node(curr_msg: discord.Message, curr_node: MsgNode, loade
                 attachment_text = await extract_attachment_text(attachment, response, kind, loaded_config)
                 if attachment_text:
                     attachment_texts.append(attachment_text)
-        except Exception:
+        except Exception as error:
             logging.exception("Error extracting attachment text")
             bad_attachment_count += 1
+            if isinstance(error, ValueError):
+                curr_node.attachment_warnings.add("Warning: An attachment could not be read or exceeds the document limits")
 
     url_texts = []
     if curr_node.role == "user" and cleaned_content:
@@ -490,23 +609,72 @@ def append_system_prompt(messages: list[dict[str, Any]], loaded_config: dict[str
         messages.append(dict(role="system", content=system_prompt))
 
 
-async def generate_nonstream_response(prompt: str, user_id: int, loaded_config: dict[str, Any], provider_slash_model: str) -> str:
-    messages = [dict(role="user", content=f"<@{user_id}>: {prompt[:loaded_config.get('max_text', 100000)]}")]
-    append_system_prompt(messages, loaded_config)
+def model_accepts_images(model: str) -> bool:
+    return any(tag in model.lower() for tag in VISION_MODEL_TAGS)
 
-    client_and_kwargs = build_openai_client_and_kwargs(loaded_config, provider_slash_model, messages[::-1], stream=False)
-    response = await client_and_kwargs["client"].chat.completions.create(**client_and_kwargs["kwargs"])
-    return response.choices[0].message.content or ""
+
+def messages_for_model(messages: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    if model_accepts_images(model):
+        return deepcopy(messages)
+    return [message | {"content": "\n".join(part.get("text", "") for part in message["content"] if part.get("type") == "text")}
+            if isinstance(message.get("content"), list) else message.copy() for message in messages]
+
+
+async def prepare_ask_request(request: GenerationRequest, loaded_config: dict[str, Any]) -> None:
+    if request.messages is not None:
+        return
+    text = request.prompt
+    images = []
+    if attachment := request.attachment:
+        kind = get_attachment_kind(attachment)
+        if kind is None:
+            raise UserFacingError("Unsupported attachment. Upload an image, text file, PDF, or DOCX.")
+        if attachment.size > loaded_config.get("max_download_bytes", 20 * 1024 * 1024):
+            raise UserFacingError("This attachment exceeds the download limit. Upload a smaller file; `/status` shows the limit.")
+        if kind == "image" and loaded_config.get("max_images", 5) < 1:
+            raise UserFacingError("Image attachments are disabled in the bot configuration.")
+        try:
+            response = await download_context(attachment.url, loaded_config)
+            if kind == "image":
+                images.append(dict(type="image_url", image_url=dict(url=f"data:{attachment.content_type};base64,{b64encode(response.content).decode('utf-8')}")))
+            else:
+                text += "\n" + await extract_attachment_text(attachment, response, kind, loaded_config)
+        except ValueError as error:
+            raise UserFacingError("This attachment could not be read or exceeds the document limits. Try a smaller or different file.") from error
+    url_texts, failed = await extract_url_texts(request.prompt, loaded_config)
+    if failed:
+        request.warnings.add("Some URLs could not be read.")
+    text += "\n" + "\n".join(url_texts)
+    max_text = loaded_config.get("max_text", 100000)
+    if len(text) > max_text:
+        request.warnings.add(f"Input was limited to {max_text:,} characters.")
+    content = f"<@{request.user_id}>: {text[:max_text].strip()}"
+    request.messages = [dict(role="user", content=[dict(type="text", text=content)] + images if images else content)]
+    append_system_prompt(request.messages, loaded_config)
+    request.messages.reverse()
+
+
+async def generate_nonstream_response(prompt: str, user_id: int, loaded_config: dict[str, Any], provider_slash_model: str, request: Optional[GenerationRequest] = None) -> str:
+    request = request or GenerationRequest(user_id, 0, "ask", provider_slash_model, prompt)
+    if request.attachment and get_attachment_kind(request.attachment) == "image" and not model_accepts_images(provider_slash_model):
+        raise UserFacingError("This model isn't configured for images. Use `/retry model:` with a vision model, or ask an administrator to select one.")
+    await prepare_ask_request(request, loaded_config)
+    client_and_kwargs = build_openai_client_and_kwargs(loaded_config, provider_slash_model, messages_for_model(request.messages, provider_slash_model), stream=False)
+    client = client_and_kwargs["client"]
+    try:
+        response = await client.chat.completions.create(**client_and_kwargs["kwargs"])
+        if not response.choices or not response.choices[0].message.content:
+            raise UserFacingError("The model returned no text. Try `/retry` or choose another model.")
+        return response.choices[0].message.content
+    finally:
+        await client.close()
 
 
 async def send_interaction_chunks(interaction: discord.Interaction, content: str, private: bool) -> None:
     max_len = 1900
     chunks = [content[i:i + max_len] for i in range(0, len(content), max_len)] or ["*(empty response)*"]
-    for index, chunk in enumerate(chunks):
-        if index == 0:
-            await interaction.followup.send(chunk, ephemeral=private)
-        else:
-            await interaction.followup.send(chunk, ephemeral=private)
+    for chunk in chunks:
+        await interaction.followup.send(chunk, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def generate_openrouter_image(prompt: str, model: str, loaded_config: dict[str, Any]) -> tuple[bytes, str]:
@@ -585,6 +753,7 @@ async def build_reply_chain_messages(start_msg: discord.Message, loaded_config: 
                 user_warnings.add(f"Warning: Max {max_images} image{'' if max_images == 1 else 's'} per message" if max_images > 0 else "Warning: Can't see images")
             if curr_node.has_bad_attachments:
                 user_warnings.add("Warning: Unsupported or unreadable attachments")
+            user_warnings.update(curr_node.attachment_warnings)
             if curr_node.has_bad_links:
                 user_warnings.add("Warning: Some URLs could not be read")
             if curr_node.fetch_parent_failed or (curr_node.parent_msg != None and len(messages) == max_messages):
@@ -595,34 +764,27 @@ async def build_reply_chain_messages(start_msg: discord.Message, loaded_config: 
     return messages, user_warnings
 
 
-async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[str, Any], log_label: str = "Message received") -> None:
+async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[str, Any], log_label: str = "Message received", request: Optional[GenerationRequest] = None) -> None:
     global last_task_time
 
-    provider_slash_model = get_effective_model(start_msg.channel, loaded_config)
-    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
-
-    provider_config = loaded_config["providers"][provider]
-    base_url = provider_config["base_url"]
-    api_key = provider_config.get("api_key", "sk-no-key-required")
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-
-    model_parameters = loaded_config["models"].get(provider_slash_model, None)
-    extra_headers = provider_config.get("extra_headers")
-    extra_query = provider_config.get("extra_query")
-    extra_body = (provider_config.get("extra_body") or {}) | (model_parameters or {}) or None
-
-    accept_images = any(x in provider_slash_model.lower() for x in VISION_MODEL_TAGS)
-    messages, user_warnings = await build_reply_chain_messages(start_msg, loaded_config, accept_images)
+    provider_slash_model = request.model if request else get_effective_model(start_msg.channel, loaded_config)
+    if request is not None and request.messages is not None:
+        messages, user_warnings = deepcopy(request.messages), request.warnings.copy()
+    else:
+        messages, user_warnings = await build_reply_chain_messages(start_msg, loaded_config, accept_images=True)
+        append_system_prompt(messages, loaded_config)
+        messages.reverse()
+        if request is not None:
+            request.messages, request.warnings = deepcopy(messages), user_warnings.copy()
+    if not model_accepts_images(provider_slash_model) and any(isinstance(message.get("content"), list) and any(part.get("type") == "image_url" for part in message["content"]) for message in messages):
+        user_warnings.add("Warning: This model can't see images")
+    messages = messages_for_model(messages, provider_slash_model)
 
     logging.info(f"{log_label} (user ID: {start_msg.author.id}, attachments: {len(start_msg.attachments)}, conversation length: {len(messages)}, model: {provider_slash_model}):\n{start_msg.content}")
-
-    append_system_prompt(messages, loaded_config)
 
     finish_reason = None
     response_msgs = []
     response_contents = []
-
-    openai_kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_headers=extra_headers, extra_query=extra_query, extra_body=extra_body)
 
     if use_plain_responses := loaded_config.get("use_plain_responses", False):
         max_message_length = 4000
@@ -656,6 +818,10 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
                 await response_msgs[-1].edit(embed=embed)
             last_task_time = datetime.now().timestamp()
 
+    if use_plain_responses and user_warnings:
+        await start_msg.reply("\n".join(sorted(user_warnings))[:1900], allowed_mentions=discord.AllowedMentions.none())
+    client_and_kwargs = build_openai_client_and_kwargs(loaded_config, provider_slash_model, messages, stream=True)
+    openai_client, openai_kwargs = client_and_kwargs["client"], client_and_kwargs["kwargs"]
     try:
         async with start_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
@@ -681,9 +847,22 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
             if use_plain_responses:
                 for content in response_contents:
                     await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+            elif finish_reason is None:
+                await update_embed(final=True)
+            if not response_contents and request is not None:
+                raise UserFacingError("The model returned no text. Try `/retry` or choose another model.")
 
-    except Exception:
-        logging.exception("Error while generating response")
+    except (Exception, asyncio.CancelledError):
+        if not use_plain_responses and response_msgs:
+            # Finalize the visible partial answer before releasing its history lock.
+            embed.description = response_contents[len(response_msgs) - 1]
+            embed.color = EMBED_COLOR_INCOMPLETE
+            embed.set_footer(text="Generation interrupted")
+            try:
+                await response_msgs[-1].edit(embed=embed)
+            except discord.HTTPException:
+                logging.exception("Couldn't finalize the interrupted reply")
+        raise
     finally:
         for response_msg in response_msgs:
             msg_nodes[response_msg.id].text = "".join(response_contents)
@@ -786,15 +965,15 @@ async def image_model_command_autocomplete(interaction: discord.Interaction, cur
 @discord.app_commands.describe(prompt="Describe the image you want", model="Optional one-off image model override")
 @discord_bot.tree.command(name="image", description="Generate an image with OpenRouter")
 async def image_command(interaction: discord.Interaction, prompt: str, model: Optional[str] = None) -> None:
-    global config, curr_image_model
+    global curr_image_model
 
-    config = await asyncio.to_thread(get_config)
+    loaded_config = await asyncio.to_thread(get_config)
 
-    if not user_has_permission_for_interaction(interaction, config):
+    if not user_has_permission_for_interaction(interaction, loaded_config):
         await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
         return
 
-    image_models = config.get("image_models") or ["openrouter/auto"]
+    image_models = loaded_config.get("image_models") or ["openrouter/auto"]
     if curr_image_model not in image_models:
         curr_image_model = image_models[0]
     selected_model = model or curr_image_model
@@ -802,26 +981,8 @@ async def image_command(interaction: discord.Interaction, prompt: str, model: Op
         await interaction.response.send_message("That image model is not in `config.yaml`.", ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
-
-    try:
-        image_bytes, media_type = await generate_openrouter_image(prompt, selected_model, config)
-        extension = {
-            "image/jpeg": "jpg",
-            "image/svg+xml": "svg",
-            "image/webp": "webp",
-        }.get(media_type, "png")
-        quoted_prompt = "\n".join(f"> {line}" if line else ">" for line in prompt[:1500].splitlines())
-        content = f"**Prompt**\n{quoted_prompt}\n\n**Model:** `{selected_model}`"
-        await interaction.followup.send(
-            content=content,
-            file=discord.File(io.BytesIO(image_bytes), filename=f"generated-image.{extension}"),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        logging.info(f"/image completed (user ID: {interaction.user.id}, model: {selected_model})")
-    except Exception:
-        logging.exception("Error while generating /image response")
-        await interaction.followup.send("Something went wrong while generating the image. Check the bot logs.", ephemeral=True)
+    request = GenerationRequest(interaction.user.id, interaction.channel_id, "image", selected_model, prompt)
+    await run_interaction_request(interaction, request, loaded_config)
 
 
 @image_command.autocomplete("model")
@@ -837,29 +998,159 @@ async def image_model_autocomplete(interaction: discord.Interaction, current: st
 
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@discord.app_commands.describe(prompt="What you want the bot to answer", private="Only show the response to you")
+@discord.app_commands.describe(prompt="What you want the bot to answer", private="Only show the response to you", attachment="Optional image, text file, PDF, or DOCX")
 @discord_bot.tree.command(name="ask", description="Ask the current model a question")
-async def ask_command(interaction: discord.Interaction, prompt: str, private: bool = False) -> None:
-    global config
-
-    config = await asyncio.to_thread(get_config)
-
-    if not user_has_permission_for_interaction(interaction, config):
+async def ask_command(interaction: discord.Interaction, prompt: str, private: bool = False, attachment: Optional[discord.Attachment] = None) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not user_has_permission_for_interaction(interaction, loaded_config):
         await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
         return
+    request = GenerationRequest(interaction.user.id, interaction.channel_id, "ask", get_effective_model(interaction.channel, loaded_config), prompt, private=private, attachment=attachment)
+    await run_interaction_request(interaction, request, loaded_config)
 
+
+async def run_interaction_request(interaction: discord.Interaction, request: GenerationRequest, loaded_config: dict[str, Any]) -> None:
+    private = request.private or request.kind == "message"
     await interaction.response.defer(thinking=True, ephemeral=private)
 
-    try:
-        provider_slash_model = get_effective_model(interaction.channel, config)
-        response = await generate_nonstream_response(prompt, interaction.user.id, config, provider_slash_model)
-        quoted_prompt = "\n".join(f"> {line}" if line else ">" for line in prompt.splitlines())
-        output = f"**Prompt**\n{quoted_prompt}\n\n**Response**\n{response}"
-        await send_interaction_chunks(interaction, output, private)
-        logging.info(f"/ask completed (user ID: {interaction.user.id}, model: {provider_slash_model})")
-    except Exception:
-        logging.exception("Error while generating /ask response")
-        await interaction.followup.send("Something went wrong while generating the response. Check the Render logs.", ephemeral=True)
+    async def notify(text: str) -> None:
+        await interaction.followup.send(text, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+
+    async def operation() -> None:
+        if request.kind == "message":
+            await send_streaming_reply(request.start_msg, loaded_config, log_label="Retry", request=request)
+            await notify("Retried your request as a new reply to the original message.")
+        elif request.kind == "image":
+            image_bytes, media_type = await generate_openrouter_image(request.prompt, request.model, loaded_config)
+            if len(image_bytes) > interaction.filesize_limit:
+                raise UserFacingError("The generated image exceeds Discord's upload limit. Try a smaller image or another model.")
+            extension = {"image/jpeg": "jpg", "image/svg+xml": "svg", "image/webp": "webp"}.get(media_type, "png")
+            quoted_prompt = "\n".join(f"> {line}" if line else ">" for line in request.prompt[:1500].splitlines())[:1700]
+            await interaction.followup.send(
+                content=f"**Prompt**\n{quoted_prompt}\n\n**Model:** `{request.model}`",
+                file=discord.File(io.BytesIO(image_bytes), filename=f"generated-image.{extension}"),
+                ephemeral=private, allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            response = await generate_nonstream_response(request.prompt, request.user_id, loaded_config, request.model, request=request)
+            quoted_prompt = "\n".join(f"> {line}" if line else ">" for line in request.prompt.splitlines())
+            warnings = "\n".join(sorted(request.warnings))
+            output = f"**Prompt**\n{quoted_prompt}\n\n**Model:** `{request.model}`\n\n"
+            if warnings:
+                output += f"{warnings}\n\n"
+            output += f"**Response**\n{response}"
+            await send_interaction_chunks(interaction, output, private)
+    await run_generation(request, loaded_config, operation, notify)
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@discord_bot.tree.command(name="stop", description="Stop your active generation in this channel")
+async def stop_command(interaction: discord.Interaction) -> None:
+    active = active_requests.get(interaction.user.id)
+    if active is None or active[0] != interaction.channel_id or active[1].done():
+        await interaction.response.send_message("You have no active generation in this channel.", ephemeral=True)
+        return
+    task = active[1]
+    if not task.cancelling():
+        task.cancel()
+    await interaction.response.send_message("Stopping your generation.", ephemeral=True)
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@discord.app_commands.describe(model="Optional model override for this retry only")
+@discord_bot.tree.command(name="retry", description="Retry your latest request here, optionally with another model")
+async def retry_command(interaction: discord.Interaction, model: Optional[str] = None) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not user_has_permission_for_interaction(interaction, loaded_config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+    prune_recent_requests()
+    previous = recent_requests.get((interaction.user.id, interaction.channel_id))
+    if previous is None:
+        await interaction.response.send_message("No recent request to retry here. Send a new request first; retries are kept for up to 30 minutes, until restart or cache eviction.", ephemeral=True)
+        return
+    selected_model = model or previous.model
+    available = (loaded_config.get("image_models") or ["openrouter/auto"]) if previous.kind == "image" else loaded_config["models"]
+    if selected_model not in available:
+        await interaction.response.send_message("That model is no longer configured. Select a model from `/retry model:`.", ephemeral=True)
+        return
+    request = replace(previous, model=selected_model, messages=deepcopy(previous.messages), warnings=previous.warnings.copy(), created_at=time.monotonic())
+    await run_interaction_request(interaction, request, loaded_config)
+
+
+@retry_command.autocomplete("model")
+async def retry_model_autocomplete(interaction: discord.Interaction, current: str) -> list[Choice[str]]:
+    loaded_config = await asyncio.to_thread(get_config)
+    prune_recent_requests()
+    previous = recent_requests.get((interaction.user.id, interaction.channel_id))
+    available = (loaded_config.get("image_models") or ["openrouter/auto"]) if previous and previous.kind == "image" else loaded_config["models"]
+    return [Choice(name=model, value=model) for model in available if current.casefold() in model.casefold()][:25]
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord.app_commands.describe(model="Default text model for this channel", reset="Clear the temporary override and restore configured defaults")
+@discord_bot.tree.command(name="channelmodel", description="View or change this channel's text model (admin only)")
+async def channel_model_command(interaction: discord.Interaction, model: Optional[str] = None, reset: bool = False) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not is_admin_user(interaction.user.id, loaded_config):
+        await interaction.response.send_message("You don't have permission to change channel models.", ephemeral=True)
+        return
+    if interaction.guild is None or interaction.channel_id is None:
+        await interaction.response.send_message("Use this command in a server channel or thread.", ephemeral=True)
+        return
+    if model and reset:
+        await interaction.response.send_message("Choose a model or reset the override, not both.", ephemeral=True)
+        return
+    if model is not None and model not in loaded_config["models"]:
+        await interaction.response.send_message("That model is not in `config.yaml`.", ephemeral=True)
+        return
+    if reset:
+        channel_models.pop(interaction.channel_id, None)
+    elif model:
+        channel_models[interaction.channel_id] = model
+    selected = get_effective_model(interaction.channel, loaded_config)
+    await interaction.response.send_message(f"This channel uses `{selected}`. Command overrides last until restart; `channel_models` in config sets persistent defaults.", ephemeral=True)
+
+
+channel_model_command.autocomplete("model")(model_autocomplete)
+
+
+@discord.app_commands.allowed_installs(guilds=True, users=True)
+@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+@discord_bot.tree.command(name="status", description="Show models, limits, and available commands")
+async def status_command(interaction: discord.Interaction) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not user_has_permission_for_interaction(interaction, loaded_config):
+        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
+        return
+    image_models = loaded_config.get("image_models") or ["openrouter/auto"]
+    image_model = curr_image_model if curr_image_model in image_models else image_models[0]
+    commands_text = "`/ask` (optional attachment, private response), `/image`, `/retry` (optional model), `/stop`, `/status`"
+    if is_admin_user(interaction.user.id, loaded_config):
+        commands_text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel`"
+    output = (
+        f"**Text model here:** `{get_effective_model(interaction.channel, loaded_config)}`\n"
+        f"**Image model:** `{image_model}`\n"
+        f"**Conversation:** {loaded_config.get('max_messages', 25)} messages, {loaded_config.get('max_text', 100000):,} characters per message, {loaded_config.get('max_images', 5)} images\n"
+        f"**Files:** {loaded_config.get('max_download_bytes', 20 * 1024 * 1024) / (1024 * 1024):g} MiB download, {loaded_config.get('max_pdf_pages', 100)} PDF pages, {loaded_config.get('max_docx_expanded_bytes', 50 * 1024 * 1024) / (1024 * 1024):g} MiB expanded DOCX\n"
+        f"**Requests:** {len(active_requests)}/{loaded_config.get('max_concurrent_requests', 4)} active; one per user; {loaded_config.get('request_cooldown_seconds', 3):g}s cooldown; {loaded_config.get('request_timeout_seconds', 600):g}s timeout\n"
+        f"**Commands:** {commands_text}"
+    )
+    await interaction.response.send_message(output, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@discord_bot.tree.error
+async def command_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError) -> None:
+    original = getattr(error, "original", error)
+    logging.error("App command failed", exc_info=(type(original), original, original.__traceback__))
+    output = friendly_error(original)
+    if interaction.response.is_done():
+        await interaction.followup.send(output, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await interaction.response.send_message(output, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @discord_bot.event
@@ -909,12 +1200,17 @@ async def on_message(new_msg: discord.Message) -> None:
     if (not is_dm and discord_bot.user not in new_msg.mentions) or new_msg.author.bot:
         return
 
-    loaded_config = await asyncio.to_thread(get_config)
-
-    if not user_has_permission_for_message(new_msg, loaded_config):
-        return
-
-    await send_streaming_reply(new_msg, loaded_config)
+    async def notify(text: str) -> None:
+        await new_msg.reply(text, allowed_mentions=discord.AllowedMentions.none())
+    try:
+        loaded_config = await asyncio.to_thread(get_config)
+        if not user_has_permission_for_message(new_msg, loaded_config):
+            return
+        request = GenerationRequest(new_msg.author.id, new_msg.channel.id, "message", get_effective_model(new_msg.channel, loaded_config), new_msg.content, start_msg=new_msg)
+        await run_generation(request, loaded_config, lambda: send_streaming_reply(new_msg, loaded_config, request=request), notify)
+    except Exception as error:
+        logging.exception("Message handler failed")
+        await notify(friendly_error(error))
 
 
 async def main() -> None:

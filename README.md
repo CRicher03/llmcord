@@ -37,6 +37,33 @@ Administrators can use `/model` to switch the model used by both app-command and
 
 Administrators can similarly use `/imagemodel` to switch the default used by `/image`. An optional model supplied directly to `/image` overrides it for that request only.
 
+Use `/channelmodel model:...` to set a text model for the current server channel or thread. Threads inherit their parent channel's model unless they have their own default. `/channelmodel` shows the effective model, and `/channelmodel reset:true` removes the temporary override. These commands are admin-only; `/model` still changes the global fallback.
+
+For defaults that survive restart, add channel IDs and existing model keys to `channel_models` in `config.yaml`, for example:
+
+```yaml
+channel_models:
+  "123456789012345678": "openrouter/openrouter/auto"
+```
+
+Selection order is the current channel's command override, its configured default, then the parent channel's override/default, then the global model. References to models removed from the configuration are ignored.
+
+### Everyday commands
+
+| Command | What it does |
+| --- | --- |
+| `/ask prompt:...` | Ask a question. Add `attachment:` for one image, text file, PDF, or DOCX, and `private:true` for a response visible only to you. Images require a model configured for vision. |
+| `/image prompt:...` | Generate an image, optionally choosing a one-off `model:`. |
+| `/stop` | Stop your own active generation in this channel, including chat, `/ask`, `/image`, and retries. Already posted partial replies remain and are marked interrupted when using embeds. |
+| `/retry` | Retry your latest accepted request in this channel. Optional `model:` selects another configured text or image model for this retry only. |
+| `/status` | Privately show the effective models, conversation/file limits, active request count, and available commands. |
+
+Retries preserve the original prepared conversation, including attachment content, without adding the previous generated answer. A mention/reply retry creates a new branch from the original message. Private `/ask` retries stay private. If a request failed before its input was prepared, retry attempts preparation again. Retry records are kept in memory, with one latest request per user/channel, up to 50 records total, and are available for up to 30 minutes; restarting clears them. Image retries generate a new image from the same prompt.
+
+One generation may run per user across all channels. The default shared limit is four simultaneous generations, with a three-second per-user cooldown between starts and a ten-minute total request timeout. Busy requests are rejected with an explanation instead of queued. These limits also apply to administrators and retries; `/stop` and `/status` remain usable while busy. Change `max_concurrent_requests`, `request_cooldown_seconds` (set to `0` to disable), and `request_timeout_seconds` in the configuration. Stopping closes the bot's active request; provider-side processing or billing may already have occurred.
+
+Failures now explain timeouts, rate limits, unavailable models/files, oversized inputs, and provider access or credit problems. Detailed exceptions stay in the bot logs. Plain chat replies also report skipped-input warnings.
+
 llmcord supports remote models from:
 - [OpenRouter](https://openrouter.ai/models)
 - [OpenAI](https://platform.openai.com/docs/models)
@@ -53,7 +80,7 @@ Or run local models with:
 ---
 
 ### And more:
-- Supports user-installed `/ask` and `/image` app commands in DMs and group DMs
+- Supports user-installed `/ask`, `/image`, `/retry`, `/stop`, and `/status` app commands in DMs and group DMs
 - Image generation through OpenRouter with a curated model selector
 - Admin model switching with `/model` and `/imagemodel`
 - Supports image attachments when using a vision model (like gpt-5, grok-4, claude-4, etc.)
@@ -95,7 +122,7 @@ Context downloads only access public HTTP(S) destinations, validating DNS and ea
 | **max_text** | The maximum amount of text allowed in a single message, including text from file attachments.<br /><br />Default: `100,000` |
 | **max_images** | The maximum number of image attachments allowed in a single message.<br /><br />Default: `5`<br /><br />**Only applicable when using a vision model.** |
 | **max_messages** | The maximum number of messages allowed in a reply chain. When exceeded, the oldest messages are dropped.<br /><br />Default: `25` |
-| **use_plain_responses** | When set to `true` the bot will use plaintext responses instead of embeds. Plaintext responses have a shorter character limit so the bot's messages may split more often.<br /><br />Default: `false`<br /><br />**Also disables streamed responses and warning messages.** |
+| **use_plain_responses** | When set to `true` the bot will use plaintext responses instead of embeds. Plaintext responses have a shorter character limit so the bot's messages may split more often.<br /><br />Default: `false`<br /><br />**Disables visible streaming; input warnings are sent separately.** |
 | **allow_dms** | Set to `false` to disable direct message access.<br /><br />Default: `true` |
 | **permissions** | Configure access permissions for `users`, `roles` and `channels`, each with a list of `allowed_ids` and `blocked_ids`.<br /><br />Control which `users` are admins with `admin_ids`. Admins can use `/model` and `/imagemodel`, and can DM the bot even if `allow_dms` is `false`.<br /><br />**Leave `allowed_ids` empty to allow ALL in that category.**<br /><br />**Role and channel permissions do not affect DMs.**<br /><br />**You can use [category](https://support.discord.com/hc/en-us/articles/115001580171-Channel-Categories-101) IDs to control channel permissions in groups.** |
 
@@ -123,7 +150,8 @@ Context downloads only access public HTTP(S) destinations, validating DNS and ea
 
 ## Notes
 
-- Run offline regression checks with `python -m unittest -v test_llmcord` after installing the requirements. Tests do not log into Discord or call model providers.
+- Run offline regression checks with `python -m unittest -v test_llmcord test_features` after installing the requirements. Tests do not log into Discord or call model providers.
+- Restart the bot after updating the code so its existing startup command sync registers the new slash commands. Command model overrides and retry history reset on restart; `channel_models` configuration persists.
 
 - If you're having issues, try my suggestions [here](https://github.com/jakobdylanc/llmcord/issues/19)
 

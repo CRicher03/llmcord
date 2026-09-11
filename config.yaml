@@ -19,6 +19,15 @@ max_docx_expanded_bytes: 52428800 # 50 MiB after ZIP expansion
 use_plain_responses: true
 allow_dms: true
 
+# Applies to chat, /ask, /image, and /retry. Each user may run one request at a time.
+request_cooldown_seconds: 3 # Set to 0 to disable the cooldown
+max_concurrent_requests: 4
+request_timeout_seconds: 600
+
+# Optional persistent channel defaults; threads inherit their parent channel's model.
+# Use a model key from the models section below.
+channel_models: {}
+
 # Image generation uses OpenRouter's dedicated image API. The first model is the default.
 image_models:
   - openrouter/auto

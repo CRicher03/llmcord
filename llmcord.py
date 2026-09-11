@@ -824,7 +824,6 @@ class ResponseControls(View):
     def __init__(self, request: GenerationRequest):
         super().__init__(timeout=900)
         self.request = request
-        self.task = asyncio.current_task()
         self.message = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -835,25 +834,6 @@ class ResponseControls(View):
             await interaction.response.send_message("You no longer have permission to use the bot here.", ephemeral=True)
             return False
         return True
-
-    @button(label="Stop", style=discord.ButtonStyle.danger)
-    async def stop_generation(self, interaction: discord.Interaction, item: discord.ui.Button) -> None:
-        active = active_requests.get(self.request.user_id)
-        if active and active[1] is self.task and not self.task.done():
-            if not self.task.cancelling():
-                self.task.cancel()
-            await interaction.response.send_message("Stopping this generation.", ephemeral=True)
-        else:
-            await interaction.response.send_message("This generation has already finished.", ephemeral=True)
-
-    @button(label="Retry", style=discord.ButtonStyle.primary, disabled=True)
-    async def retry_response(self, interaction: discord.Interaction, item: discord.ui.Button) -> None:
-        loaded_config = await asyncio.to_thread(get_config)
-        available = (loaded_config.get("image_models") or ["openrouter/auto"]) if self.request.kind == "image" else loaded_config["models"]
-        if self.request.model not in available or (self.request.second_model and self.request.second_model not in available):
-            await interaction.response.send_message("A model used by this response is no longer configured. Start a new request.", ephemeral=True)
-            return
-        await run_interaction_request(interaction, copy_for_retry(self.request), loaded_config)
 
     @button(label="Download", style=discord.ButtonStyle.secondary, disabled=True)
     async def download_response(self, interaction: discord.Interaction, item: discord.ui.Button) -> None:
@@ -890,8 +870,6 @@ async def with_response_controls(request: GenerationRequest, loaded_config: dict
         await operation()
     finally:
         if controls:
-            controls.stop_generation.disabled = True
-            controls.retry_response.disabled = False
             controls.download_response.disabled = not bool(request.output)
         try:
             if request.answer_message:
@@ -1533,8 +1511,8 @@ async def help_command(interaction: discord.Interaction) -> None:
         "• `/summarize message:<link or ID>` — summarize a reply chain in this channel.\n"
         "• `/image prompt:A tiny astronaut tending a garden` — generate an image.\n\n"
         "**Controls**\n"
-        "Stop cancels your generation. Retry repeats that answer's input; `/retry model:…` changes the model for your latest request. "
-        "Download saves Markdown. Long answers can arrive as files.\n\n"
+        "`/stop` cancels your generation. `/retry` repeats your latest request; `/retry model:…` changes its model. "
+        "The Download button saves Markdown. Long answers can arrive as files.\n\n"
         "**Models and privacy**\n"
         "`/status` shows this channel's model and limits. Private answers, retries, and files stay private. "
         "Model overrides on retries don't change the channel default."

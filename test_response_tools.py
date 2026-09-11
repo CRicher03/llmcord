@@ -116,7 +116,7 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("".join(call.args[0] for call in user.followup.send.call_args_list), text)
             self.assertTrue(all("file" not in call.kwargs for call in user.followup.send.call_args_list))
 
-    async def test_controls_authorization_download_and_old_response_retry(self):
+    async def test_controls_authorization_and_download(self):
         request = self.request()
         request.private = True
         request.output = "exact answer"
@@ -131,31 +131,16 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
             call = owner.response.send_message.call_args
             self.assertEqual(call.kwargs["file"].fp.read(), b"exact answer")
             self.assertTrue(call.kwargs["ephemeral"])
-            bot.recent_requests[(123, 10)] = self.request()
-            bot.recent_requests[(123, 10)].prompt = "new unrelated question"
-            with patch.object(bot, "run_interaction_request", AsyncMock()) as run:
-                await view.retry_response.callback(owner)
-            retried = run.call_args.args[1]
-            self.assertEqual(retried.messages, request.messages)
-            self.assertTrue(retried.private)
-            self.assertEqual(retried.output, "")
         finally:
             view.stop()
 
-    async def test_old_stop_button_cannot_cancel_new_task(self):
+    async def test_download_is_the_only_button(self):
         view = bot.ResponseControls(self.request())
-        newer = asyncio.create_task(asyncio.sleep(60))
-        bot.active_requests[123] = (10, newer)
         try:
-            await view.stop_generation.callback(fixtures.interaction())
-            self.assertFalse(newer.cancelling())
+            self.assertEqual([item.label for item in view.children], ["Download"])
+            self.assertEqual([item["label"] for item in view.to_components()[0]["components"]], ["Download"])
         finally:
             view.stop()
-            newer.cancel()
-            try:
-                await newer
-            except asyncio.CancelledError:
-                pass
 
     async def test_controls_lifecycle_and_stop_cancel_active_generation(self):
         self.config["response_buttons"] = True
@@ -173,12 +158,10 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
         await ready.wait()
         view = views[0]
         try:
-            self.assertFalse(view.stop_generation.disabled)
-            self.assertTrue(view.retry_response.disabled)
-            await view.stop_generation.callback(fixtures.interaction())
+            self.assertTrue(view.download_response.disabled)
+            await bot.stop_command.callback(fixtures.interaction())
             self.assertFalse(await task)
-            self.assertTrue(view.stop_generation.disabled)
-            self.assertFalse(view.retry_response.disabled)
+            self.assertTrue(view.download_response.disabled)
             self.assertEqual(bot.active_requests, {})
             await view.on_timeout()
             self.assertTrue(all(item.disabled for item in view.children))
@@ -195,9 +178,8 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertTrue(first.kwargs["ephemeral"])
             self.assertFalse(view.download_response.disabled)
-            self.assertTrue(view.stop_generation.disabled)
             self.assertIn("answer", view.request.output)
-            self.assertEqual(len(view.to_components()[0]["components"]), 3)
+            self.assertEqual(len(view.to_components()[0]["components"]), 1)
         finally:
             view.stop()
 

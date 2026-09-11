@@ -12,6 +12,9 @@ max_attachment_text: 100000
 max_urls: 3
 max_url_text: 15000
 url_fetch_timeout: 10
+max_download_bytes: 20971520 # 20 MiB per URL or attachment
+max_pdf_pages: 100
+max_docx_expanded_bytes: 52428800 # 50 MiB after ZIP expansion
 
 use_plain_responses: true
 allow_dms: true

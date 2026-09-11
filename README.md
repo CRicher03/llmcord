@@ -79,6 +79,12 @@ Or run local models with:
 
 > Any setting can be read from an environment variable by appending `_env` to its name (e.g. `bot_token_env: DISCORD_BOT_TOKEN`).
 
+Permission ID settings accept a single ID, a JSON list, or comma-separated IDs in environment variables. Empty or unset values become empty lists; an empty allowlist allows everyone in that category. Invalid IDs raise a configuration error.
+
+URL and attachment downloads are limited to four concurrent requests and `max_download_bytes` per file (default: 20 MiB). `url_fetch_timeout` is a total time limit per download, including DNS and redirects (default: 10 seconds). PDF extraction accepts at most `max_pdf_pages` (default: 100), and DOCX files may expand to at most `max_docx_expanded_bytes` (default: 50 MiB). Adjust these settings for larger documents. Oversized or unreadable files are skipped; embed responses display the existing attachment/URL warnings.
+
+Context downloads only access public HTTP(S) destinations, validating DNS and each redirect. They bypass environment proxies and request uncompressed responses; servers that insist on HTTP compression are skipped. These restrictions apply to context ingestion, so local LLM provider endpoints still work.
+
 ### Discord settings:
 
 | Setting | Description |
@@ -116,6 +122,8 @@ Or run local models with:
    ```
 
 ## Notes
+
+- Run offline regression checks with `python -m unittest -v test_llmcord` after installing the requirements. Tests do not log into Discord or call model providers.
 
 - If you're having issues, try my suggestions [here](https://github.com/jakobdylanc/llmcord/issues/19)
 

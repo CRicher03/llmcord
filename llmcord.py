@@ -8,8 +8,9 @@ import logging
 import os
 import json
 import re
+import socket
+from zipfile import ZipFile
 from typing import Any, Literal, Optional
-from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 import discord
@@ -89,7 +90,24 @@ def resolve_env(node: Any) -> Any:
 
 def get_config(filename: str = "config.yaml") -> dict[str, Any]:
     with open(filename, encoding="utf-8") as file:
-        return resolve_env(yaml.safe_load(file))
+        loaded_config = resolve_env(yaml.safe_load(file))
+    permissions = loaded_config.setdefault("permissions", {})
+    for category in ("users", "roles", "channels"):
+        settings = permissions.setdefault(category, {})
+        for key in ("allowed_ids", "blocked_ids", "admin_ids") if category == "users" else ("allowed_ids", "blocked_ids"):
+            settings[key] = normalize_permission_ids(settings.get(key))
+    return loaded_config
+
+
+def normalize_permission_ids(value: Any) -> list[int]:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return []
+    if isinstance(value, str):
+        value = parse_env_value(value)
+    values = value if isinstance(value, list) else [value]
+    if any(isinstance(item, bool) or not str(item).isdigit() or int(item) <= 0 for item in values):
+        raise ValueError("Permission IDs must be positive integers or lists of positive integers")
+    return [int(item) for item in values]
 
 
 def get_effective_model(channel: Any, loaded_config: dict[str, Any]) -> str:
@@ -109,6 +127,7 @@ activity = discord.CustomActivity(name=(config.get("status_message") or "github.
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
 httpx_client = httpx.AsyncClient()
+download_slots = asyncio.Semaphore(4)
 
 
 @dataclass
@@ -190,12 +209,25 @@ def normalize_extracted_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text.replace("\r\n", "\n").replace("\r", "\n")).strip()
 
 
-def extract_pdf_text(data: bytes) -> str:
+def extract_pdf_text(data: bytes, max_chars: int = 100000, max_pages: int = 100) -> str:
     reader = PdfReader(io.BytesIO(data))
-    return normalize_extracted_text("\n\n".join(page.extract_text() or "" for page in reader.pages))
+    if len(reader.pages) > max_pages:
+        raise ValueError("PDF exceeds max_pdf_pages")
+    parts = []
+    remaining = max_chars
+    for page in reader.pages:
+        text = (page.extract_text() or "")[:remaining]
+        parts.append(text)
+        remaining -= len(text) + 2
+        if remaining <= 0:
+            break
+    return normalize_extracted_text("\n\n".join(parts))[:max_chars]
 
 
-def extract_docx_text(data: bytes) -> str:
+def extract_docx_text(data: bytes, max_chars: int = 100000, max_expanded_bytes: int = 50 * 1024 * 1024) -> str:
+    with ZipFile(io.BytesIO(data)) as archive:
+        if sum(entry.file_size for entry in archive.infolist()) > max_expanded_bytes:
+            raise ValueError("DOCX exceeds max_docx_expanded_bytes")
     document = Document(io.BytesIO(data))
     parts = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
 
@@ -205,7 +237,7 @@ def extract_docx_text(data: bytes) -> str:
             if cells:
                 parts.append(" | ".join(cells))
 
-    return normalize_extracted_text("\n".join(parts))
+    return normalize_extracted_text("\n".join(parts))[:max_chars]
 
 
 def extract_html_text(data: bytes) -> str:
@@ -219,14 +251,15 @@ def extract_html_text(data: bytes) -> str:
     return normalize_extracted_text("\n\n".join(part for part in (title, body) if part))
 
 
-def extract_response_text(url: str, content_type: str, data: bytes) -> str:
+def extract_response_text(url: str, content_type: str, data: bytes, max_chars: int = 100000, loaded_config: Optional[dict[str, Any]] = None) -> str:
+    limits = loaded_config or {}
     lowered_url = url.lower().split("?", 1)[0]
     lowered_type = content_type.lower()
 
     if "application/pdf" in lowered_type or lowered_url.endswith(".pdf"):
-        return extract_pdf_text(data)
+        return extract_pdf_text(data, max_chars, limits.get("max_pdf_pages", 100))
     if DOCX_CONTENT_TYPE in lowered_type or lowered_url.endswith(".docx"):
-        return extract_docx_text(data)
+        return extract_docx_text(data, max_chars, limits.get("max_docx_expanded_bytes", 50 * 1024 * 1024))
     if "html" in lowered_type:
         return extract_html_text(data)
     if lowered_type.startswith("text/") or "json" in lowered_type or "xml" in lowered_type:
@@ -235,11 +268,14 @@ def extract_response_text(url: str, content_type: str, data: bytes) -> str:
 
 
 def is_fetchable_url(url: str) -> bool:
-    parsed_url = urlparse(url)
-    if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname:
+    try:
+        parsed_url = httpx.URL(url)
+    except (httpx.InvalidURL, ValueError):
+        return False
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.host or parsed_url.userinfo:
         return False
 
-    hostname = parsed_url.hostname.lower()
+    hostname = parsed_url.host.lower().rstrip(".")
     if hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".local"):
         return False
 
@@ -248,13 +284,67 @@ def is_fetchable_url(url: str) -> bool:
     except ValueError:
         return True
 
-    return not (ip_address.is_private or ip_address.is_loopback or ip_address.is_link_local or ip_address.is_multicast)
+    return ip_address.is_global and not ip_address.is_multicast
+
+
+async def resolve_public_addresses(url: httpx.URL) -> list[str]:
+    if not is_fetchable_url(str(url)):
+        raise ValueError("URL must point to a public HTTP(S) address")
+    results = await asyncio.get_running_loop().getaddrinfo(
+        url.host, url.port or (443 if url.scheme == "https" else 80), type=socket.SOCK_STREAM,
+    )
+    addresses = list(dict.fromkeys(result[4][0] for result in results))
+    if not addresses or any(not ipaddress.ip_address(address).is_global or ipaddress.ip_address(address).is_multicast for address in addresses):
+        raise ValueError("URL resolves to a non-public address")
+    return addresses
+
+
+async def download_context(url: str, loaded_config: dict[str, Any]) -> httpx.Response:
+    """Fetch bounded public content, pinning each connection to a validated IP."""
+    max_bytes = loaded_config.get("max_download_bytes", 20 * 1024 * 1024)
+    timeout = loaded_config.get("url_fetch_timeout", 10)
+    async with download_slots, asyncio.timeout(timeout):
+        current_url = httpx.URL(url)
+        for redirect_count in range(6):
+            addresses = await resolve_public_addresses(current_url)
+            # A separate pool per origin avoids reusing TLS connections across hosts
+            # sharing an IP. Disable proxies so they cannot resolve the hostname again.
+            async with httpx.AsyncClient(trust_env=False, timeout=timeout) as client:
+                for index, address in enumerate(addresses):
+                    try:
+                        async with client.stream(
+                            "GET", current_url.copy_with(host=address),
+                            headers={"Host": current_url.netloc.decode("ascii"), "User-Agent": "llmcord/1.0", "Accept-Encoding": "identity"},
+                            extensions={"sni_hostname": current_url.host},
+                            follow_redirects=False,
+                        ) as response:
+                            if response.status_code in (301, 302, 303, 307, 308):
+                                if redirect_count == 5 or "location" not in response.headers:
+                                    raise ValueError("Invalid or excessive redirects")
+                                current_url = current_url.join(response.headers["location"])
+                                break
+                            response.raise_for_status()
+                            if response.headers.get("content-encoding", "identity").lower() != "identity":
+                                raise ValueError("Server ignored the uncompressed-download request")
+                            if int(response.headers.get("content-length", "0")) > max_bytes:
+                                raise ValueError("Download exceeds max_download_bytes")
+                            data = bytearray()
+                            async for chunk in response.aiter_raw(chunk_size=65536):
+                                if len(data) + len(chunk) > max_bytes:
+                                    raise ValueError("Download exceeds max_download_bytes")
+                                data.extend(chunk)
+                            return httpx.Response(response.status_code, headers=response.headers, content=bytes(data), request=httpx.Request("GET", current_url))
+                    except httpx.ConnectError:
+                        if index == len(addresses) - 1:
+                            raise
+        raise ValueError("Too many redirects")
 
 
 async def extract_url_texts(text: str, loaded_config: dict[str, Any]) -> tuple[list[str], bool]:
     max_urls = loaded_config.get("max_urls", 3)
     max_url_text = loaded_config.get("max_url_text", 15000)
-    timeout = loaded_config.get("url_fetch_timeout", 10)
+    if max_urls <= 0:
+        return [], False
     urls = []
     had_failures = False
 
@@ -272,19 +362,15 @@ async def extract_url_texts(text: str, loaded_config: dict[str, Any]) -> tuple[l
 
     for url in urls:
         try:
-            response = await httpx_client.get(
-                url,
-                follow_redirects=True,
-                timeout=timeout,
-                headers={"User-Agent": "llmcord/1.0"},
-            )
-            response.raise_for_status()
+            response = await download_context(url, loaded_config)
 
             extracted_text = await asyncio.to_thread(
                 extract_response_text,
                 str(response.url),
                 response.headers.get("content-type", ""),
                 response.content,
+                max_url_text,
+                loaded_config,
             )
             if extracted_text:
                 url_texts.append(f"[URL: {url}]\n{extracted_text[:max_url_text]}")
@@ -303,10 +389,10 @@ async def extract_attachment_text(attachment: discord.Attachment, response: http
     if kind == "text":
         return response.text[:max_attachment_text]
     if kind == "pdf":
-        text = await asyncio.to_thread(extract_pdf_text, response.content)
+        text = await asyncio.to_thread(extract_pdf_text, response.content, max_attachment_text, loaded_config.get("max_pdf_pages", 100))
         return f"[PDF: {attachment.filename}]\n{text[:max_attachment_text]}"
     if kind == "docx":
-        text = await asyncio.to_thread(extract_docx_text, response.content)
+        text = await asyncio.to_thread(extract_docx_text, response.content, max_attachment_text, loaded_config.get("max_docx_expanded_bytes", 50 * 1024 * 1024))
         return f"[DOCX: {attachment.filename}]\n{text[:max_attachment_text]}"
     return ""
 
@@ -315,23 +401,20 @@ async def populate_msg_node(curr_msg: discord.Message, curr_node: MsgNode, loade
     cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
     curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
 
-    attachment_kinds = [(att, kind) for att in curr_msg.attachments if (kind := get_attachment_kind(att))]
-    attachment_responses = await asyncio.gather(
-        *[httpx_client.get(att.url) for att, _ in attachment_kinds],
-        return_exceptions=True,
-    )
-
     attachment_texts = []
     curr_node.images = []
-    bad_attachment_count = len(curr_msg.attachments) - len(attachment_kinds)
-
-    for (attachment, kind), response in zip(attachment_kinds, attachment_responses):
-        if isinstance(response, Exception):
-            logging.warning("Error fetching attachment for message context: %s", response)
+    bad_attachment_count = 0
+    image_count = 0
+    for attachment in curr_msg.attachments:
+        kind = get_attachment_kind(attachment)
+        if kind == "image":
+            image_count += 1
+        if kind is None or (kind == "image" and image_count > loaded_config.get("max_images", 5)) or attachment.size > loaded_config.get("max_download_bytes", 20 * 1024 * 1024):
             bad_attachment_count += 1
             continue
 
         try:
+            response = await download_context(attachment.url, loaded_config)
             if kind == "image":
                 curr_node.images.append(dict(type="image_url", image_url=dict(url=f"data:{attachment.content_type};base64,{b64encode(response.content).decode('utf-8')}")))
             else:
@@ -535,7 +618,7 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
 
     append_system_prompt(messages, loaded_config)
 
-    curr_content = finish_reason = None
+    finish_reason = None
     response_msgs = []
     response_contents = []
 
@@ -555,6 +638,24 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
         msg_nodes[response_msg.id] = MsgNode(parent_msg=start_msg)
         await msg_nodes[response_msg.id].lock.acquire()
 
+    async def update_embed(final: bool = False) -> None:
+        global last_task_time
+        if use_plain_responses or not response_contents:
+            return
+        start_next_msg = len(response_msgs) < len(response_contents)
+        full = len(response_contents[-1]) == max_message_length
+        time_delta = datetime.now().timestamp() - last_task_time
+        if start_next_msg or time_delta >= EDIT_DELAY_SECONDS or full or final:
+            embed.description = response_contents[-1] + ("" if full or final else STREAMING_INDICATOR)
+            good_finish = finish_reason is not None and finish_reason.lower() in ("stop", "end_turn")
+            embed.color = EMBED_COLOR_COMPLETE if (full and not final) or good_finish else EMBED_COLOR_INCOMPLETE
+            if start_next_msg:
+                await reply_helper(embed=embed, silent=True)
+            else:
+                await asyncio.sleep(max(0, EDIT_DELAY_SECONDS - time_delta))
+                await response_msgs[-1].edit(embed=embed)
+            last_task_time = datetime.now().timestamp()
+
     try:
         async with start_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
@@ -566,38 +667,16 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
 
                 finish_reason = choice.finish_reason
 
-                prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
-
-                new_content = prev_content if finish_reason == None else (prev_content + curr_content)
-
-                if response_contents == [] and new_content == "":
-                    continue
-
-                if start_next_msg := response_contents == [] or len(response_contents[-1] + new_content) > max_message_length:
-                    response_contents.append("")
-
-                response_contents[-1] += new_content
-
-                if not use_plain_responses:
-                    time_delta = datetime.now().timestamp() - last_task_time
-
-                    ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                    msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
-                    is_final_edit = finish_reason != None or msg_split_incoming
-                    is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
-
-                    if start_next_msg or ready_to_edit or is_final_edit:
-                        embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
-
-                        if start_next_msg:
-                            await reply_helper(embed=embed, silent=True)
-                        else:
-                            await asyncio.sleep(EDIT_DELAY_SECONDS - time_delta)
-                            await response_msgs[-1].edit(embed=embed)
-
-                        last_task_time = datetime.now().timestamp()
+                remaining = choice.delta.content or ""
+                while remaining:
+                    if not response_contents or len(response_contents[-1]) == max_message_length:
+                        response_contents.append("")
+                    available = max_message_length - len(response_contents[-1])
+                    response_contents[-1] += remaining[:available]
+                    remaining = remaining[available:]
+                    await update_embed(final=finish_reason is not None and not remaining)
+                if finish_reason is not None and not choice.delta.content:
+                    await update_embed(final=True)
 
             if use_plain_responses:
                 for content in response_contents:
@@ -605,10 +684,11 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
 
     except Exception:
         logging.exception("Error while generating response")
-
-    for response_msg in response_msgs:
-        msg_nodes[response_msg.id].text = "".join(response_contents)
-        msg_nodes[response_msg.id].lock.release()
+    finally:
+        for response_msg in response_msgs:
+            msg_nodes[response_msg.id].text = "".join(response_contents)
+            msg_nodes[response_msg.id].lock.release()
+        await openai_client.close()
 
     if (num_nodes := len(msg_nodes)) > MAX_MESSAGE_NODES:
         for msg_id in sorted(msg_nodes.keys())[: num_nodes - MAX_MESSAGE_NODES]:
@@ -841,7 +921,8 @@ async def main() -> None:
     await discord_bot.start(config["bot_token"])
 
 
-try:
-    asyncio.run(main())
-except KeyboardInterrupt:
-    pass
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

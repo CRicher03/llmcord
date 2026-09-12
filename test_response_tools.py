@@ -139,7 +139,7 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(user.response.defer.call_args.kwargs["ephemeral"])
             self.assertFalse(view.download_response.disabled)
             self.assertIn("answer", view.request.output)
-            self.assertEqual(len(view.to_components()[0]["components"]), 4)
+            self.assertEqual(len(view.to_components()[0]["components"]), 3)
         finally:
             view.stop()
 

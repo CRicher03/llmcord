@@ -937,7 +937,6 @@ class ResponseControls(View):
             return
         for label, instruction in (
             ("Go deeper", "Expand on your previous answer with more detail and concrete examples."),
-            ("Shorten", "Rewrite your previous answer more concisely, keeping the essential information."),
             ("Challenge this", "Critically examine the previous answer. Identify weak assumptions, counterarguments, and corrections."),
         ):
             item = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, row=0)
@@ -1763,7 +1762,7 @@ async def help_command(interaction: discord.Interaction) -> None:
         "• `/image prompt:A tiny astronaut tending a garden` — generate an image.\n\n"
         "**Controls**\n"
         "`/stop` cancels your generation. `/retry` repeats your latest request; `/retry model:…` changes its model. "
-        "Go deeper, Shorten, and Challenge this build on an answer. Change model reruns its prompt. "
+        "Go deeper and Challenge this build on an answer. Change model reruns its prompt. "
         "Download saves Markdown. Long answers can arrive as files.\n\n"
         "**Models and privacy**\n"
         "`/status` shows this channel's model and limits. Private answers, retries, and files stay private. "

@@ -33,8 +33,8 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         previous = bot.recent_requests[(123, 10)]
         snapshot = deepcopy(previous.messages)
         actions = {item.label: item for item in previous.controls.children}
-        self.assertEqual(set(actions), {'Download', 'Go deeper', 'Shorten', 'Challenge this', 'Change model'})
-        for label in ('Go deeper', 'Shorten', 'Challenge this'):
+        self.assertEqual(set(actions), {'Download', 'Go deeper', 'Challenge this', 'Change model'})
+        for label in ('Go deeper', 'Challenge this'):
             await actions[label].callback(user)
             current = bot.recent_requests[(123, 10)]
             self.assertTrue(current.private)
@@ -51,7 +51,7 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         user = self.user()
         await bot.ask_command.callback(user, 'question')
         previous = bot.recent_requests[(123, 10)]
-        action = next(item for item in previous.controls.children if item.label == 'Shorten')
+        action = next(item for item in previous.controls.children if item.label == 'Go deeper')
         bot.active_requests[123] = (10, NS())
         await action.callback(user)
         self.assertEqual(self.client.chat.completions.create.await_count, 1)
@@ -61,17 +61,17 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         await action.callback(user)
         self.assertEqual(self.client.chat.completions.create.await_count, 1)
 
-    async def test_shorten_resolves_thinking_before_waiting_on_provider(self):
+    async def test_followup_resolves_thinking_before_waiting_on_provider(self):
         self.config['response_buttons'] = True
         for private in (False, True):
             previous = self.request()
             previous.private = private
             previous.messages = [{'role': 'user', 'content': 'Explain this'}]
-            previous.answer_text = 'A long answer to shorten.'
+            previous.answer_text = 'An answer to expand.'
             previous.completed = True
             controls = bot.ResponseControls(previous)
             controls.finish()
-            action = next(item for item in controls.children if item.label == 'Shorten')
+            action = next(item for item in controls.children if item.label == 'Go deeper')
             user = self.user()
             entered, release = asyncio.Event(), asyncio.Event()
             async def generate(**kwargs):
@@ -80,17 +80,17 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(user.response.defer.call_args.kwargs['ephemeral'], private)
                 user.followup.send.assert_not_awaited()
                 self.assertEqual(kwargs['messages'][-2]['content'], previous.answer_text)
-                self.assertIn('more concisely', kwargs['messages'][-1]['content'])
+                self.assertIn('more detail', kwargs['messages'][-1]['content'])
                 entered.set()
                 await release.wait()
-                return NS(choices=[NS(message=NS(content='Short answer.'))])
+                return NS(choices=[NS(message=NS(content='Expanded answer.'))])
             self.client.chat.completions.create.side_effect = generate
             task = asyncio.create_task(action.callback(user))
             try:
                 await asyncio.wait_for(entered.wait(), 2)
                 release.set()
                 await asyncio.wait_for(task, 2)
-                self.assertIn('Short answer.', user.followup.send.call_args.args[0])
+                self.assertIn('Expanded answer.', user.followup.send.call_args.args[0])
                 self.assertEqual(user.followup.send.call_args.kwargs['ephemeral'], private)
                 user.edit_original_response.return_value.delete.assert_awaited_once()
             finally:
@@ -102,7 +102,7 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
                 if (current := bot.recent_requests.get((123, 10))) and current.controls:
                     current.controls.stop()
 
-    async def test_rejected_shorten_resolves_deferred_response(self):
+    async def test_rejected_followup_resolves_deferred_response(self):
         previous = self.request()
         previous.completed = True
         controls = bot.ResponseControls(previous)
@@ -110,7 +110,7 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         user = self.user()
         bot.active_requests[123] = (10, NS())
         try:
-            action = next(item for item in controls.children if item.label == 'Shorten')
+            action = next(item for item in controls.children if item.label == 'Go deeper')
             await action.callback(user)
             self.assertIn('already have', user.edit_original_response.call_args.kwargs['content'])
             self.client.chat.completions.create.assert_not_awaited()

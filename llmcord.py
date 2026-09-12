@@ -109,6 +109,14 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
             raise ValueError("max_concurrent_requests must be an integer")
     if not isinstance(loaded_config.get("channel_models") or {}, dict):
         raise ValueError("channel_models must map channel IDs to configured model names")
+    prompts = loaded_config.get("channel_prompts", {})
+    if not isinstance(prompts, dict) or any(
+        isinstance(key, bool) or not str(key).isdigit() or int(key) <= 0 or not isinstance(value, str)
+        for key, value in prompts.items()
+    ):
+        raise ValueError("channel_prompts must map positive channel IDs to prompt strings")
+    if not isinstance(loaded_config.get("persist_channel_prompts", True), bool):
+        raise ValueError("persist_channel_prompts must be true or false")
     threshold = loaded_config.get("long_answer_threshold", 6000)
     if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
         raise ValueError("long_answer_threshold must be a nonnegative integer")
@@ -146,6 +154,7 @@ curr_image_model = (config.get("image_models") or ["openrouter/auto"])[0]
 msg_nodes = {}
 last_task_time = 0
 channel_models: dict[int, str] = {}
+channel_prompts: dict[int, str] = {}
 edited_message_ids: dict[int, None] = {}
 
 
@@ -174,20 +183,45 @@ def restore_model_selections(loaded_config: dict[str, Any]) -> None:
 def save_model_selections(loaded_config: dict[str, Any]) -> str:
     if not loaded_config.get("persist_model_selections", False):
         return " Selections last until restart."
+    return save_state(loaded_config.get("model_state_file", "data/model-selections.json"),
+                      {"model": curr_model, "image_model": curr_image_model, "channel_models": channel_models})
+
+
+def restore_channel_prompts(loaded_config: dict[str, Any]) -> None:
+    if not loaded_config.get("persist_channel_prompts", True):
+        return
+    try:
+        state = json.loads(Path(loaded_config.get("prompt_state_file", "data/channel-prompts.json")).read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or any(not str(key).isdigit() or int(key) <= 0 or not isinstance(value, str) for key, value in state.items()):
+            raise ValueError("Invalid saved channel prompts")
+        channel_prompts.update({int(key): value for key, value in state.items()})
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError):
+        logging.exception("Could not restore channel prompts; using configured defaults")
+
+
+def save_channel_prompts(loaded_config: dict[str, Any]) -> str:
+    if not loaded_config.get("persist_channel_prompts", True):
+        return " Prompt override lasts until restart."
+    return save_state(loaded_config.get("prompt_state_file", "data/channel-prompts.json"), channel_prompts)
+
+
+def save_state(filename: str, state: dict) -> str:
     temporary = None
     try:
-        target = Path(loaded_config.get("model_state_file", "data/model-selections.json"))
+        target = Path(filename)
         target.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as file:
             temporary = file.name
-            json.dump({"model": curr_model, "image_model": curr_image_model, "channel_models": channel_models}, file)
+            json.dump(state, file)
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, target)
         temporary = None
         return " Saved for the next restart."
     except OSError:
-        logging.exception("Could not save model selections")
+        logging.exception("Could not save bot settings")
         return " Changed for this session, but saving failed; check the bot's writable storage."
     finally:
         if temporary:
@@ -211,6 +245,7 @@ class GenerationRequest:
     warnings: set[str] = field(default_factory=set)
     created_at: float = field(default_factory=time.monotonic)
     second_model: Optional[str] = None
+    parent_channel_id: Optional[int] = None
     output: str = ""
     controls: Any = None
     answer_message: Any = None
@@ -667,16 +702,26 @@ def build_openai_client_and_kwargs(loaded_config: dict[str, Any], provider_slash
     )
 
 
-def get_system_prompt(loaded_config: dict[str, Any]) -> str:
+def get_system_prompt(loaded_config: dict[str, Any], channel_id: Optional[int] = None, parent_id: Optional[int] = None) -> str:
     system_prompt = loaded_config.get("system_prompt", "") or ""
+    configured = loaded_config.get("channel_prompts", {})
+    for selected_id in (channel_id, parent_id):
+        if selected_id is None:
+            continue
+        if selected_id in channel_prompts:
+            system_prompt = channel_prompts[selected_id]
+            break
+        if str(selected_id) in configured or selected_id in configured:
+            system_prompt = configured[str(selected_id)] if str(selected_id) in configured else configured[selected_id]
+            break
     if system_prompt:
         now = datetime.now().astimezone()
         system_prompt = system_prompt.replace("{date}", now.strftime("%B %d %Y")).replace("{time}", now.strftime("%H:%M:%S %Z%z")).strip()
     return system_prompt
 
 
-def append_system_prompt(messages: list[dict[str, Any]], loaded_config: dict[str, Any]) -> None:
-    if system_prompt := get_system_prompt(loaded_config):
+def append_system_prompt(messages: list[dict[str, Any]], loaded_config: dict[str, Any], channel_id: Optional[int] = None, parent_id: Optional[int] = None) -> None:
+    if system_prompt := get_system_prompt(loaded_config, channel_id, parent_id):
         messages.append(dict(role="system", content=system_prompt))
 
 
@@ -724,7 +769,7 @@ async def prepare_ask_request(request: GenerationRequest, loaded_config: dict[st
         request.warnings.add(f"Input was limited to {max_text:,} characters.")
     content = f"<@{request.user_id}>: {text[:max_text].strip()}"
     request.messages = [dict(role="user", content=[dict(type="text", text=content)] + images if images else content)]
-    append_system_prompt(request.messages, loaded_config)
+    append_system_prompt(request.messages, loaded_config, request.channel_id, request.parent_channel_id)
     request.messages.reverse()
 
 
@@ -1143,7 +1188,7 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
     else:
         await update_progress(request, "Reading conversation and attachments…")
         messages, user_warnings = await build_reply_chain_messages(start_msg, loaded_config, accept_images=True)
-        append_system_prompt(messages, loaded_config)
+        append_system_prompt(messages, loaded_config, getattr(start_msg.channel, "id", None), getattr(start_msg.channel, "parent_id", None))
         messages.reverse()
         if request is not None:
             request.messages, request.warnings = deepcopy(messages), user_warnings.copy()
@@ -1464,6 +1509,7 @@ debate_command.autocomplete("model_b")(model_autocomplete)
 
 
 async def run_interaction_request(interaction: discord.Interaction, request: GenerationRequest, loaded_config: dict[str, Any]) -> None:
+    request.parent_channel_id = getattr(interaction.channel, "parent_id", None)
     if not user_has_permission_for_interaction(interaction, loaded_config):
         await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
         return
@@ -1636,6 +1682,43 @@ async def channel_model_command(interaction: discord.Interaction, model: Optiona
 channel_model_command.autocomplete("model")(model_autocomplete)
 
 
+@discord.app_commands.allowed_installs(guilds=True, users=False)
+@discord.app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@discord.app_commands.describe(prompt="Replacement system prompt for this channel", reset="Remove the override and inherit configured defaults")
+@discord_bot.tree.command(name="channelprompt", description="Set or reset this channel's system prompt (admin only)")
+async def channel_prompt_command(interaction: discord.Interaction, prompt: Optional[str] = None, reset: bool = False) -> None:
+    loaded_config = await asyncio.to_thread(get_config)
+    if not is_admin_user(interaction.user.id, loaded_config):
+        await interaction.response.send_message("You don't have permission to change channel prompts.", ephemeral=True)
+        return
+    if interaction.guild is None or interaction.channel_id is None:
+        await interaction.response.send_message("Use this command in a server channel or thread.", ephemeral=True)
+        return
+    if prompt is not None and reset:
+        await interaction.response.send_message("Choose a prompt or reset the override, not both.", ephemeral=True)
+        return
+    if prompt is not None and (not prompt.strip() or len(prompt) > 4000):
+        await interaction.response.send_message("Enter a prompt between 1 and 4,000 characters.", ephemeral=True)
+        return
+    if reset:
+        channel_prompts.pop(interaction.channel_id, None)
+    elif prompt is not None:
+        channel_prompts[interaction.channel_id] = prompt.strip()
+    saved = save_channel_prompts(loaded_config) if reset or prompt is not None else ""
+    source = "global system prompt"
+    configured = loaded_config.get("channel_prompts", {})
+    for selected_id, label in ((interaction.channel_id, "this channel"), (getattr(interaction.channel, "parent_id", None), "parent channel")):
+        if selected_id is None:
+            continue
+        if selected_id in channel_prompts:
+            source = f"{label}'s command override"
+            break
+        if selected_id in configured or str(selected_id) in configured:
+            source = f"{label}'s configured prompt"
+            break
+    await interaction.response.send_message(f"Using {source}.{saved}", ephemeral=True)
+
+
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @discord_bot.tree.command(name="status", description="Show models, limits, and available commands")
@@ -1648,7 +1731,7 @@ async def status_command(interaction: discord.Interaction) -> None:
     image_model = curr_image_model if curr_image_model in image_models else image_models[0]
     commands_text = "`/help`, `/ask` (attachment/private), `/compare`, `/battle`, `/debate`, `/image`, `/retry` (model), `/stop`, `/status`"
     if is_admin_user(interaction.user.id, loaded_config):
-        commands_text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel`"
+        commands_text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel`, `/channelprompt`"
     output = (
         f"**Text model here:** `{get_effective_model(interaction.channel, loaded_config)}`\n"
         f"**Image model:** `{image_model}`\n"
@@ -1687,7 +1770,7 @@ async def help_command(interaction: discord.Interaction) -> None:
         "Model overrides on retries don't change the channel default."
     )
     if is_admin_user(interaction.user.id, loaded_config):
-        text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel` select defaults."
+        text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel` select defaults; `/channelprompt` sets this channel's personality."
     await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
@@ -1781,6 +1864,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
 async def main() -> None:
     restore_model_selections(config)
+    restore_channel_prompts(config)
     await discord_bot.start(config["bot_token"])
 
 

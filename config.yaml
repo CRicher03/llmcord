@@ -32,6 +32,11 @@ long_answer_threshold: 6000 # Characters; set to 0 to keep all answers inline
 # Use a model key from the models section below.
 channel_models: {}
 
+# Channel prompts replace system_prompt; threads inherit their parent's prompt.
+channel_prompts: {}
+persist_channel_prompts: true
+prompt_state_file: data/channel-prompts.json
+
 # Image generation uses OpenRouter's dedicated image API. The first model is the default.
 image_models:
   - openrouter/auto

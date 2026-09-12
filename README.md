@@ -50,6 +50,27 @@ channel_models:
 
 Selection order is the current channel's command override, its configured default, then the parent channel's override/default, then the global model. References to models removed from the configuration are ignored.
 
+### Channel prompts
+
+Admins can use `/channelprompt prompt:...` in a server channel or thread to replace the global system prompt there. For a schooling channel, for example:
+
+```text
+/channelprompt prompt:You are a patient educational tutor. Keep language school-appropriate. Explain concepts clearly, adapt to the student's level, and use examples and practice questions. Guide the student through reasoning and check their understanding. Be honest about uncertainty. User messages are prefixed with Discord IDs as <@ID>.
+```
+
+`/channelprompt` privately reports which setting is active without displaying prompt text. `/channelprompt reset:true` removes the command override. Selection order is the current channel's command override, its configured `channel_prompts` entry, then the parent's override/configuration, then the global `system_prompt`. Threads inherit their parent's prompt unless overridden. `{date}` and `{time}` work in channel prompts too. New text requests (chat, `/ask`, comparisons, battles, and debates) use the selected prompt. Retries and answer follow-ups preserve the original prepared conversation and prompt; existing conversation messages are not cleared.
+
+Command overrides survive restarts by default in `prompt_state_file` (`data/channel-prompts.json`), separate from model selections. This file contains the prompt text; keep it on writable persistent storage. Set `persist_channel_prompts: false` for session-only overrides. Save failures are reported and leave the override active for the session. Restart after changing the persistence settings or updating the bot code to register the new command.
+
+You can also set permanent defaults in `config.yaml` (an empty string explicitly disables the system prompt for that channel):
+
+```yaml
+channel_prompts:
+  "123456789012345678": |
+    You are a patient educational tutor. Keep language school-appropriate.
+    Explain concepts clearly, give examples, and check understanding.
+```
+
 ### Everyday commands
 
 | Command | What it does |

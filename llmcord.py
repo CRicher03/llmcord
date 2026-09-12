@@ -1475,7 +1475,11 @@ async def run_interaction_request(interaction: discord.Interaction, request: Gen
     await interaction.response.defer(thinking=True, ephemeral=private)
 
     async def notify(text: str) -> None:
-        await interaction.followup.send(text, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
+        if request.controls is None or request.controls.message is None:
+            # Explicitly resolve the deferred response, including admission failures.
+            await interaction.edit_original_response(content=text, allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await interaction.followup.send(text, ephemeral=private, allowed_mentions=discord.AllowedMentions.none())
 
     async def operation() -> None:
         if request.kind == "message":
@@ -1546,8 +1550,10 @@ async def run_interaction_request(interaction: discord.Interaction, request: Gen
                 output += f"{warnings}\n\n"
             output += f"**Response**\n{response}"
             await publish_answer(interaction, request, output, loaded_config)
-    async def send_controls(*args, **kwargs):
-        return await interaction.followup.send(*args, **kwargs, ephemeral=private, wait=True, allowed_mentions=discord.AllowedMentions.none())
+    async def send_controls(content: str, **kwargs):
+        # PATCH @original clears Discord's loading state directly. Do not depend
+        # on the legacy first-followup behavior, especially for button callbacks.
+        return await interaction.edit_original_response(content=content, **kwargs, allowed_mentions=discord.AllowedMentions.none())
     await run_generation(request, loaded_config, lambda: with_response_controls(request, loaded_config, operation, send_controls), notify)
 
 

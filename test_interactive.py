@@ -1,5 +1,6 @@
 """Offline coverage for interactive answers, blind battles, and debate rounds."""
 from copy import deepcopy
+import asyncio
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -59,6 +60,64 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await previous.controls.interaction_check(user))
         await action.callback(user)
         self.assertEqual(self.client.chat.completions.create.await_count, 1)
+
+    async def test_shorten_resolves_thinking_before_waiting_on_provider(self):
+        self.config['response_buttons'] = True
+        for private in (False, True):
+            previous = self.request()
+            previous.private = private
+            previous.messages = [{'role': 'user', 'content': 'Explain this'}]
+            previous.answer_text = 'A long answer to shorten.'
+            previous.completed = True
+            controls = bot.ResponseControls(previous)
+            controls.finish()
+            action = next(item for item in controls.children if item.label == 'Shorten')
+            user = self.user()
+            entered, release = asyncio.Event(), asyncio.Event()
+            async def generate(**kwargs):
+                user.edit_original_response.assert_awaited_once()
+                self.assertEqual(user.edit_original_response.call_args.kwargs['content'], 'Working.')
+                self.assertEqual(user.response.defer.call_args.kwargs['ephemeral'], private)
+                user.followup.send.assert_not_awaited()
+                self.assertEqual(kwargs['messages'][-2]['content'], previous.answer_text)
+                self.assertIn('more concisely', kwargs['messages'][-1]['content'])
+                entered.set()
+                await release.wait()
+                return NS(choices=[NS(message=NS(content='Short answer.'))])
+            self.client.chat.completions.create.side_effect = generate
+            task = asyncio.create_task(action.callback(user))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                release.set()
+                await asyncio.wait_for(task, 2)
+                self.assertIn('Short answer.', user.followup.send.call_args.args[0])
+                self.assertEqual(user.followup.send.call_args.kwargs['ephemeral'], private)
+                user.edit_original_response.return_value.delete.assert_awaited_once()
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                controls.stop()
+                if (current := bot.recent_requests.get((123, 10))) and current.controls:
+                    current.controls.stop()
+
+    async def test_rejected_shorten_resolves_deferred_response(self):
+        previous = self.request()
+        previous.completed = True
+        controls = bot.ResponseControls(previous)
+        controls.finish()
+        user = self.user()
+        bot.active_requests[123] = (10, NS())
+        try:
+            action = next(item for item in controls.children if item.label == 'Shorten')
+            await action.callback(user)
+            self.assertIn('already have', user.edit_original_response.call_args.kwargs['content'])
+            self.client.chat.completions.create.assert_not_awaited()
+            user.followup.send.assert_not_awaited()
+        finally:
+            bot.active_requests.clear()
+            controls.stop()
 
     async def test_followup_history_is_bounded_without_mutating_source(self):
         previous = self.request()

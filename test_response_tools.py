@@ -133,10 +133,10 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
         user = fixtures.interaction()
         user.followup.send.return_value = NS(edit=AsyncMock())
         await bot.ask_command.callback(user, "question", private=True)
-        first = user.followup.send.call_args_list[0]
+        first = user.edit_original_response.call_args
         view = first.kwargs["view"]
         try:
-            self.assertTrue(first.kwargs["ephemeral"])
+            self.assertTrue(user.response.defer.call_args.kwargs["ephemeral"])
             self.assertFalse(view.download_response.disabled)
             self.assertIn("answer", view.request.output)
             self.assertEqual(len(view.to_components()[0]["components"]), 4)

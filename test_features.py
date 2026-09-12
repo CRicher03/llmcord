@@ -24,7 +24,8 @@ def interaction(user_id=123, channel_id=10, guild=True):
               channel=NS(id=channel_id, parent_id=None, category_id=None),
               guild=NS(id=1) if guild else None, filesize_limit=10 * 1024 * 1024,
               response=NS(defer=AsyncMock(), send_message=AsyncMock(), is_done=lambda: False),
-              followup=NS(send=AsyncMock()))
+              followup=NS(send=AsyncMock()),
+              edit_original_response=AsyncMock(return_value=NS(edit=AsyncMock(), delete=AsyncMock())))
 
 
 class FeatureTests(unittest.IsolatedAsyncioTestCase):
@@ -220,7 +221,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs(level="ERROR"):
             await bot.ask_command.callback(user, "what is this?", private=True, attachment=attachment)
         self.client.chat.completions.create.assert_not_awaited()
-        self.assertIn("vision", user.followup.send.call_args.args[0])
+        self.assertIn("vision", user.edit_original_response.call_args.kwargs["content"])
         with patch.object(bot, "download_context", AsyncMock(return_value=httpx.Response(200, content=b"png"))):
             await bot.retry_command.callback(interaction(), model="test/vision:vision")
         messages = self.client.chat.completions.create.call_args.kwargs["messages"]
@@ -244,7 +245,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             await bot.ask_command.callback(user, "summarize", attachment=attachment)
             download.assert_not_awaited()
         self.client.chat.completions.create.assert_not_awaited()
-        self.assertIn("smaller", user.followup.send.call_args.args[0])
+        self.assertIn("smaller", user.edit_original_response.call_args.kwargs["content"])
 
     async def test_pdf_and_docx_ask_attachments(self):
         doc = Document()

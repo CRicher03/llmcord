@@ -89,7 +89,8 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         self.config["response_buttons"] = True
         user = fixtures.interaction()
         progress, answer = NS(edit=AsyncMock(), delete=AsyncMock()), NS(edit=AsyncMock())
-        user.followup.send.side_effect = [progress, answer]
+        user.edit_original_response.return_value = progress
+        user.followup.send.return_value = answer
         await bot.ask_command.callback(user, "question", private=True)
         progress.delete.assert_awaited_once()
         args = answer.edit.call_args.kwargs
@@ -120,7 +121,8 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         self.config["response_buttons"] = True
         user = fixtures.interaction()
         progress = NS(edit=AsyncMock(), delete=AsyncMock())
-        user.followup.send.side_effect = [progress, NS(edit=AsyncMock())]
+        user.edit_original_response.return_value = progress
+        user.followup.send.return_value = NS(edit=AsyncMock())
         await bot.compare_command.callback(user, "question", "test/model", "test/vision:vision")
         stages = [call.kwargs.get("content", "") for call in progress.edit.call_args_list]
         self.assertTrue(any("Head to head · 1/2" in stage for stage in stages))

@@ -102,7 +102,7 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(view.message, answer)
             self.assertFalse(view.download_response.disabled)
             stages = [call.kwargs.get("content") for call in progress.edit.call_args_list]
-            self.assertIn("Generating answer…", stages)
+            self.assertIn("Working.", stages)
             await view.on_timeout()
             self.assertNotIn("content", answer.edit.call_args.kwargs)
         finally:
@@ -123,8 +123,8 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         user.followup.send.side_effect = [progress, NS(edit=AsyncMock())]
         await bot.compare_command.callback(user, "question", "test/model", "test/vision:vision")
         stages = [call.kwargs.get("content", "") for call in progress.edit.call_args_list]
-        self.assertTrue(any("model 1 of 2" in stage for stage in stages))
-        self.assertTrue(any("model 2 of 2" in stage for stage in stages))
+        self.assertTrue(any("Head to head · 1/2" in stage for stage in stages))
+        self.assertTrue(any("Head to head · 2/2" in stage for stage in stages))
         bot.recent_requests[(123, 10)].controls.stop()
 
     async def test_embed_footer_preserves_answer_and_retries_reset_ui(self):
@@ -135,7 +135,7 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         request.output = "answer"
         await bot.with_response_controls(request, self.config, AsyncMock(), AsyncMock())
         embed = request.answer_message.edit.call_args.kwargs["embed"]
-        self.assertEqual(embed.description, "answer")
+        self.assertEqual(embed.description, "answer\n\n" + bot.RESPONSE_DIVIDER)
         self.assertIn("interrupted", embed.footer.text)
         self.assertIn("test/model", embed.footer.text)
         retry = bot.copy_for_retry(request)
@@ -184,7 +184,7 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         call = user.response.send_message.call_args
         self.assertLessEqual(len(call.args[0]), 2000)
         self.assertTrue(call.kwargs["ephemeral"])
-        for value in ("/ask", "/compare", "/summarize", "private", "Reply", "DMs"):
+        for value in ("/ask", "/compare", "private", "Reply", "DMs"):
             self.assertIn(value, call.args[0])
         self.assertEqual(bot.help_command.to_dict(bot.discord_bot.tree)["name"], "help")
         self.config["permissions"]["users"]["blocked_ids"] = [123]

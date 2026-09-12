@@ -1,6 +1,5 @@
-"""Regression checks for comparisons, summaries, buttons, and answer files."""
+"""Regression checks for comparisons, buttons, and answer files."""
 import asyncio
-from copy import deepcopy
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -54,45 +53,6 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retry.messages, original.messages)
         self.assertEqual(self.client.chat.completions.create.await_count, 4)
         self.assertEqual(bot.copy_for_retry(retry).output, "")
-
-    async def test_summary_reads_selected_chain_and_retains_snapshot_for_retry(self):
-        user = fixtures.interaction()
-        user.permissions = NS(view_channel=True, read_message_history=True)
-        user.channel.fetch_message = AsyncMock(return_value=NS(id=100))
-        chain = [{"role": "user", "content": "What is next?"}, {"role": "assistant", "content": "We agreed to ship Friday."}]
-        builder = AsyncMock(return_value=(chain, {"Warning: truncated history"}))
-        with patch.object(bot, "build_reply_chain_messages", builder):
-            await bot.summarize_command.callback(user, "https://discord.com/channels/1/10/100", private=True)
-            first = deepcopy(self.client.chat.completions.create.call_args.kwargs["messages"])
-            await bot.retry_command.callback(user)
-        user.channel.fetch_message.assert_awaited_once_with(100)
-        builder.assert_awaited_once()
-        self.assertTrue(builder.call_args.kwargs["same_channel_only"])
-        self.assertIn("decisions", first[0]["content"])
-        self.assertIn("ship Friday", first[1]["content"])
-        self.assertEqual(self.client.chat.completions.create.call_args.kwargs["messages"], first)
-        self.assertIn("truncated history", user.followup.send.call_args.args[0])
-        self.assertTrue(user.followup.send.call_args.kwargs["ephemeral"])
-
-    async def test_summary_rejects_cross_channel_links_and_missing_history_access(self):
-        user = fixtures.interaction()
-        user.channel.fetch_message = AsyncMock()
-        await bot.summarize_command.callback(user, "https://discord.com/channels/1/20/100")
-        user.channel.fetch_message.assert_not_awaited()
-        user.permissions = NS(view_channel=True, read_message_history=False)
-        with self.assertLogs(level="ERROR"):
-            await bot.summarize_command.callback(user, "100")
-        user.channel.fetch_message.assert_not_awaited()
-        self.client.chat.completions.create.assert_not_awaited()
-
-    async def test_summary_chain_stops_before_cross_channel_parent(self):
-        parent = NS(id=2, channel=NS(id=20))
-        source = NS(id=1, channel=NS(id=10))
-        bot.msg_nodes[1] = bot.MsgNode(text="current channel", role="user", parent_msg=parent)
-        messages, warnings = await bot.build_reply_chain_messages(source, self.config, False, same_channel_only=True)
-        self.assertEqual(len(messages), 1)
-        self.assertNotIn(2, bot.msg_nodes)
-        self.assertTrue(any("outside" in text for text in warnings))
 
     async def test_long_answer_file_contains_exact_unicode_and_code(self):
         user = fixtures.interaction()
@@ -179,12 +139,12 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(first.kwargs["ephemeral"])
             self.assertFalse(view.download_response.disabled)
             self.assertIn("answer", view.request.output)
-            self.assertEqual(len(view.to_components()[0]["components"]), 1)
+            self.assertEqual(len(view.to_components()[0]["components"]), 4)
         finally:
             view.stop()
 
     async def test_new_commands_register_valid_schemas(self):
-        for command in (bot.compare_command, bot.summarize_command):
+        for command in (bot.compare_command,):
             schema = command.to_dict(bot.discord_bot.tree)
             self.assertLessEqual(len(schema["description"]), 100)
             self.assertTrue(any(option["name"] == "private" for option in schema["options"]))

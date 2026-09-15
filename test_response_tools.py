@@ -1,4 +1,4 @@
-"""Regression checks for comparisons, buttons, and answer files."""
+"""Regression checks for buttons, and answer files."""
 import asyncio
 from types import SimpleNamespace as NS
 import unittest
@@ -13,46 +13,8 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
     request = fixtures.FeatureTests.request
     streaming_message = fixtures.FeatureTests.streaming_message
 
-    async def test_comparison_has_identical_inputs_labeled_outputs_and_private_delivery(self):
-        self.client.chat.completions.create.side_effect = [NS(choices=[NS(message=NS(content="first answer"))]), NS(choices=[NS(message=NS(content="second answer"))])]
-        user = fixtures.interaction()
-        await bot.compare_command.callback(user, "question", "test/model", "test/vision:vision", private=True)
-        calls = self.client.chat.completions.create.await_args_list
-        self.assertEqual(calls[0].kwargs["messages"], calls[1].kwargs["messages"])
-        self.assertEqual([call.kwargs["model"] for call in calls], ["model", "vision"])
-        output = user.followup.send.call_args.args[0]
-        self.assertIn("## test/model", output)
-        self.assertIn("## test/vision:vision", output)
-        self.assertIn("second answer", output)
-        self.assertTrue(user.followup.send.call_args.kwargs["ephemeral"])
-        self.assertEqual(bot.active_requests, {})
-
-    async def test_comparison_retains_success_when_other_model_fails(self):
-        self.client.chat.completions.create.side_effect = [TimeoutError(), NS(choices=[NS(message=NS(content="working answer"))])]
-        user = fixtures.interaction()
-        with self.assertLogs(level="ERROR"):
-            await bot.compare_command.callback(user, "question", "test/model", "test/vision:vision")
-        output = user.followup.send.call_args.args[0]
-        self.assertIn("timed out", output)
-        self.assertIn("working answer", output)
-        self.assertEqual(self.client.close.await_count, 2)
-
-    async def test_compare_validation_and_permission_checks(self):
-        for models in [("test/model", "test/model"), ("test/model", "missing")]:
-            await bot.compare_command.callback(fixtures.interaction(), "question", *models)
-        self.config["permissions"]["users"]["blocked_ids"] = [123]
-        await bot.compare_command.callback(fixtures.interaction(), "question", "test/model", "test/vision:vision")
-        self.client.chat.completions.create.assert_not_awaited()
-
-    async def test_compare_retry_keeps_both_models_and_clears_old_output(self):
-        await bot.compare_command.callback(fixtures.interaction(), "question", "test/model", "test/vision:vision")
-        original = bot.recent_requests[(123, 10)]
-        await bot.retry_command.callback(fixtures.interaction())
-        retry = bot.recent_requests[(123, 10)]
-        self.assertEqual(retry.second_model, "test/vision:vision")
-        self.assertEqual(retry.messages, original.messages)
-        self.assertEqual(self.client.chat.completions.create.await_count, 4)
-        self.assertEqual(bot.copy_for_retry(retry).output, "")
+    async def test_compare_command_is_removed(self):
+        self.assertIsNone(bot.discord_bot.tree.get_command("compare"))
 
     async def test_long_answer_file_contains_exact_unicode_and_code(self):
         user = fixtures.interaction()
@@ -76,7 +38,7 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("".join(call.args[0] for call in user.followup.send.call_args_list), text)
             self.assertTrue(all("file" not in call.kwargs for call in user.followup.send.call_args_list))
 
-    async def test_controls_authorization_and_download(self):
+    async def test_controls_authorization(self):
         request = self.request()
         request.private = True
         request.output = "exact answer"
@@ -87,18 +49,14 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await view.interaction_check(fixtures.interaction(channel_id=20)))
             owner = fixtures.interaction()
             self.assertTrue(await view.interaction_check(owner))
-            await view.download_response.callback(owner)
-            call = owner.response.send_message.call_args
-            self.assertEqual(call.kwargs["file"].fp.read(), b"exact answer")
-            self.assertTrue(call.kwargs["ephemeral"])
         finally:
             view.stop()
 
-    async def test_download_is_the_only_button(self):
+    async def test_ordinary_response_has_no_buttons(self):
         view = bot.ResponseControls(self.request())
         try:
-            self.assertEqual([item.label for item in view.children], ["Download"])
-            self.assertEqual([item["label"] for item in view.to_components()[0]["components"]], ["Download"])
+            self.assertEqual([item.label for item in view.children], [])
+            self.assertEqual(view.to_components(), [])
         finally:
             view.stop()
 
@@ -118,17 +76,17 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
         await ready.wait()
         view = views[0]
         try:
-            self.assertTrue(view.download_response.disabled)
+            self.assertEqual(view.children, [])
             await bot.stop_command.callback(fixtures.interaction())
             self.assertFalse(await task)
-            self.assertTrue(view.download_response.disabled)
+            self.assertEqual(view.children, [])
             self.assertEqual(bot.active_requests, {})
             await view.on_timeout()
             self.assertTrue(all(item.disabled for item in view.children))
         finally:
             view.stop()
 
-    async def test_successful_private_ask_controls_enable_download(self):
+    async def test_successful_private_ask_has_no_buttons(self):
         self.config["response_buttons"] = True
         user = fixtures.interaction()
         user.followup.send.return_value = NS(edit=AsyncMock())
@@ -137,14 +95,14 @@ class ResponseToolTests(unittest.IsolatedAsyncioTestCase):
         view = first.kwargs["view"]
         try:
             self.assertTrue(user.response.defer.call_args.kwargs["ephemeral"])
-            self.assertFalse(view.download_response.disabled)
+            self.assertEqual(view.children, [])
             self.assertIn("answer", view.request.output)
-            self.assertEqual(len(view.to_components()[0]["components"]), 3)
+            self.assertEqual(view.to_components(), [])
         finally:
             view.stop()
 
     async def test_new_commands_register_valid_schemas(self):
-        for command in (bot.compare_command,):
+        for command in (bot.battle_command, bot.debate_command):
             schema = command.to_dict(bot.discord_bot.tree)
             self.assertLessEqual(len(schema["description"]), 100)
             self.assertTrue(any(option["name"] == "private" for option in schema["options"]))

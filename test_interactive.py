@@ -26,98 +26,15 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         user.followup.send.return_value = NS(edit=AsyncMock(), delete=AsyncMock())
         return user
 
-    async def test_answer_actions_preserve_private_context_and_original_snapshot(self):
+    async def test_answer_controls_have_no_buttons(self):
         self.config['response_buttons'] = True
         user = self.user()
         await bot.ask_command.callback(user, 'original question', private=True)
         previous = bot.recent_requests[(123, 10)]
-        snapshot = deepcopy(previous.messages)
         actions = {item.label: item for item in previous.controls.children}
-        self.assertEqual(set(actions), {'Download', 'Go deeper', 'Challenge this', 'Change model'})
-        for label in ('Go deeper', 'Challenge this'):
-            await actions[label].callback(user)
-            current = bot.recent_requests[(123, 10)]
-            self.assertTrue(current.private)
-            self.assertEqual(current.messages[:-2], snapshot)
-            self.assertEqual(current.messages[-2], {'role': 'assistant', 'content': 'answer'})
-            self.assertEqual(current.kind, 'ask')
-            current.controls.stop()
-        self.assertEqual(previous.messages, snapshot)
-        self.assertTrue(all(call.kwargs['ephemeral'] for call in user.followup.send.call_args_list))
-        previous.controls.stop()
-
-    async def test_actions_respect_busy_state_and_revoked_permissions(self):
-        self.config['response_buttons'] = True
-        user = self.user()
-        await bot.ask_command.callback(user, 'question')
-        previous = bot.recent_requests[(123, 10)]
-        action = next(item for item in previous.controls.children if item.label == 'Go deeper')
-        bot.active_requests[123] = (10, NS())
-        await action.callback(user)
-        self.assertEqual(self.client.chat.completions.create.await_count, 1)
-        bot.active_requests.clear()
+        self.assertEqual(set(actions), set())
         self.config['permissions']['users']['blocked_ids'] = [123]
         self.assertFalse(await previous.controls.interaction_check(user))
-        await action.callback(user)
-        self.assertEqual(self.client.chat.completions.create.await_count, 1)
-
-    async def test_followup_resolves_thinking_before_waiting_on_provider(self):
-        self.config['response_buttons'] = True
-        for private in (False, True):
-            previous = self.request()
-            previous.private = private
-            previous.messages = [{'role': 'user', 'content': 'Explain this'}]
-            previous.answer_text = 'An answer to expand.'
-            previous.completed = True
-            controls = bot.ResponseControls(previous)
-            controls.finish()
-            action = next(item for item in controls.children if item.label == 'Go deeper')
-            user = self.user()
-            entered, release = asyncio.Event(), asyncio.Event()
-            async def generate(**kwargs):
-                user.edit_original_response.assert_awaited_once()
-                self.assertEqual(user.edit_original_response.call_args.kwargs['content'], 'Working.')
-                self.assertEqual(user.response.defer.call_args.kwargs['ephemeral'], private)
-                user.followup.send.assert_not_awaited()
-                self.assertEqual(kwargs['messages'][-2]['content'], previous.answer_text)
-                self.assertIn('more detail', kwargs['messages'][-1]['content'])
-                entered.set()
-                await release.wait()
-                return NS(choices=[NS(message=NS(content='Expanded answer.'))])
-            self.client.chat.completions.create.side_effect = generate
-            task = asyncio.create_task(action.callback(user))
-            try:
-                await asyncio.wait_for(entered.wait(), 2)
-                release.set()
-                await asyncio.wait_for(task, 2)
-                self.assertIn('Expanded answer.', user.followup.send.call_args.args[0])
-                self.assertEqual(user.followup.send.call_args.kwargs['ephemeral'], private)
-                user.edit_original_response.return_value.delete.assert_awaited_once()
-            finally:
-                release.set()
-                if not task.done():
-                    task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
-                controls.stop()
-                if (current := bot.recent_requests.get((123, 10))) and current.controls:
-                    current.controls.stop()
-
-    async def test_rejected_followup_resolves_deferred_response(self):
-        previous = self.request()
-        previous.completed = True
-        controls = bot.ResponseControls(previous)
-        controls.finish()
-        user = self.user()
-        bot.active_requests[123] = (10, NS())
-        try:
-            action = next(item for item in controls.children if item.label == 'Go deeper')
-            await action.callback(user)
-            self.assertIn('already have', user.edit_original_response.call_args.kwargs['content'])
-            self.client.chat.completions.create.assert_not_awaited()
-            user.followup.send.assert_not_awaited()
-        finally:
-            bot.active_requests.clear()
-            controls.stop()
 
     async def test_followup_history_is_bounded_without_mutating_source(self):
         previous = self.request()
@@ -171,10 +88,10 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(model, bot.response_footer(request))
         self.assertIn('Answer A', request.output)
         vote = next(item for item in request.controls.children if item.label == 'Vote A')
-        elapsed = bot.response_footer(request).rsplit(' · ', 1)[-1]
+        elapsed = bot.response_footer(request).rsplit(' ', 1)[-1]
         with patch.object(bot.time, 'monotonic', return_value=request.started_at + 500):
             await vote.callback(user)
-            self.assertEqual(bot.response_footer(request).rsplit(' · ', 1)[-1], elapsed)
+            self.assertEqual(bot.response_footer(request).rsplit(' ', 1)[-1], elapsed)
         self.assertTrue(request.revealed)
         self.assertIn(request.model, user.followup.send.call_args.args[0])
         self.assertIn(request.second_model, user.followup.send.call_args.args[0])
@@ -194,7 +111,7 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         request = bot.recent_requests[(123, 10)]
         self.assertFalse(request.completed)
         self.assertNotIn('secret model', request.output)
-        self.assertEqual([item.label for item in request.controls.children], ['Download'])
+        self.assertEqual([item.label for item in request.controls.children], [])
 
     async def test_debate_second_model_sees_first_and_modal_continues_private_round(self):
         user = self.user()
@@ -231,7 +148,7 @@ class InteractiveTests(unittest.IsolatedAsyncioTestCase):
         request = bot.recent_requests[(123, 10)]
         self.assertIn('first argument', request.output)
         self.assertFalse(request.completed)
-        self.assertEqual([item.label for item in request.controls.children], ['Download'])
+        self.assertEqual([item.label for item in request.controls.children], [])
 
     async def test_new_command_validation_and_schemas(self):
         user = self.user()

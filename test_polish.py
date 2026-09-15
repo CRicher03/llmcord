@@ -95,39 +95,50 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         progress.delete.assert_awaited_once()
         args = answer.edit.call_args.kwargs
         self.assertIn("answer", args["content"])
-        self.assertIn("test/model", args["content"])
-        self.assertRegex(args["content"], r"· \d+\.\ds$")
+        self.assertIn("model", args["content"])
+        self.assertRegex(args["content"], r"\n\n-# model \d+\.\ds$")
+        self.assertNotIn("─", args["content"])
         self.assertLessEqual(len(args["content"]), 2000)
         view = args["view"]
         try:
             self.assertIs(view.message, answer)
-            self.assertFalse(view.download_response.disabled)
+            self.assertEqual(view.children, [])
             stages = [call.kwargs.get("content") for call in progress.edit.call_args_list]
-            self.assertIn("Working.", stages)
+            self.assertEqual(user.edit_original_response.call_args.kwargs["content"], "Working...")
+            self.assertEqual(stages, [])
             await view.on_timeout()
             self.assertNotIn("content", answer.edit.call_args.kwargs)
         finally:
             view.stop()
         self.assertTrue(all(call.kwargs["ephemeral"] for call in user.followup.send.call_args_list))
 
-    async def test_attachment_and_comparison_progress_stages(self):
+    async def test_attachment_and_battle_keep_working_progress(self):
         request = self.request()
         request.attachment = NS(filename="notes.txt", content_type="text/plain", size=3, url="https://cdn.example/file")
         progress = NS(edit=AsyncMock())
         request.controls = NS(message=progress)
         with patch.object(bot, "download_context", AsyncMock(return_value=bot.httpx.Response(200, text="notes"))):
             await bot.prepare_ask_request(request, self.config)
-        self.assertIn("Reading attachment…", [call.kwargs["content"] for call in progress.edit.call_args_list])
+        progress.edit.assert_not_awaited()
         self.config["response_buttons"] = True
         user = fixtures.interaction()
         progress = NS(edit=AsyncMock(), delete=AsyncMock())
         user.edit_original_response.return_value = progress
         user.followup.send.return_value = NS(edit=AsyncMock())
-        await bot.compare_command.callback(user, "question", "test/model", "test/vision:vision")
-        stages = [call.kwargs.get("content", "") for call in progress.edit.call_args_list]
-        self.assertTrue(any("Head to head · 1/2" in stage for stage in stages))
-        self.assertTrue(any("Head to head · 2/2" in stage for stage in stages))
+        await bot.battle_command.callback(user, "question")
+        self.assertEqual(user.edit_original_response.call_args.kwargs["content"], "Working...")
+        progress.edit.assert_not_awaited()
+        progress.delete.assert_awaited_once()
         bot.recent_requests[(123, 10)].controls.stop()
+
+    async def test_footer_hides_provider_prefix_and_vision_flag(self):
+        request = self.request()
+        request.model = "openrouter/openrouter/auto"
+        request.elapsed_seconds = 4.1
+        self.assertEqual(bot.response_footer(request), "openrouter/auto 4.1s")
+        request.second_model = "openrouter/anthropic/claude:vision"
+        self.assertEqual(bot.response_footer(request), "openrouter/auto / anthropic/claude 4.1s")
+        self.assertEqual(request.model, "openrouter/openrouter/auto")
 
     async def test_embed_footer_preserves_answer_and_retries_reset_ui(self):
         request = self.request()
@@ -137,9 +148,9 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         request.output = "answer"
         await bot.with_response_controls(request, self.config, AsyncMock(), AsyncMock())
         embed = request.answer_message.edit.call_args.kwargs["embed"]
-        self.assertEqual(embed.description, "answer\n\n" + bot.RESPONSE_DIVIDER)
+        self.assertEqual(embed.description, "answer")
         self.assertIn("interrupted", embed.footer.text)
-        self.assertIn("test/model", embed.footer.text)
+        self.assertIn("model", embed.footer.text)
         retry = bot.copy_for_retry(request)
         self.assertIsNone(retry.answer_message)
         self.assertIsNone(retry.answer_embed)
@@ -186,7 +197,7 @@ class PolishTests(unittest.IsolatedAsyncioTestCase):
         call = user.response.send_message.call_args
         self.assertLessEqual(len(call.args[0]), 2000)
         self.assertTrue(call.kwargs["ephemeral"])
-        for value in ("/ask", "/compare", "private", "Reply", "DMs"):
+        for value in ("/ask", "/battle", "private", "Reply", "DMs"):
             self.assertIn(value, call.args[0])
         self.assertEqual(bot.help_command.to_dict(bot.discord_bot.tree)["name"], "help")
         self.config["permissions"]["users"]["blocked_ids"] = [123]

@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 import discord
 from discord.app_commands import Choice
 from discord.ext import commands
-from discord.ui import LayoutView, TextDisplay, View, button
+from discord.ui import LayoutView, TextDisplay, View
 from docx import Document
 from dotenv import load_dotenv
 import httpx
@@ -235,7 +235,7 @@ def save_state(filename: str, state: dict) -> str:
 class GenerationRequest:
     user_id: int
     channel_id: int
-    kind: Literal["ask", "message", "image", "compare", "battle", "debate"]
+    kind: Literal["ask", "message", "image", "battle", "debate"]
     model: str
     prompt: str
     private: bool = False
@@ -742,7 +742,6 @@ async def prepare_ask_request(request: GenerationRequest, loaded_config: dict[st
     text = request.prompt
     images = []
     if attachment := request.attachment:
-        await update_progress(request, "Reading attachment…")
         kind = get_attachment_kind(attachment)
         if kind is None:
             raise UserFacingError("Unsupported attachment. Upload an image, text file, PDF, or DOCX.")
@@ -758,8 +757,6 @@ async def prepare_ask_request(request: GenerationRequest, loaded_config: dict[st
                 text += "\n" + await extract_attachment_text(attachment, response, kind, loaded_config)
         except ValueError as error:
             raise UserFacingError("This attachment could not be read or exceeds the document limits. Try a smaller or different file.") from error
-    if URL_RE.search(request.prompt):
-        await update_progress(request, "Reading linked pages…")
     url_texts, failed = await extract_url_texts(request.prompt, loaded_config)
     if failed:
         request.warnings.add("Some URLs could not be read.")
@@ -778,8 +775,6 @@ async def generate_nonstream_response(prompt: str, user_id: int, loaded_config: 
     if request.attachment and get_attachment_kind(request.attachment) == "image" and not model_accepts_images(provider_slash_model):
         raise UserFacingError("This model isn't configured for images. Use `/retry model:` with a vision model, or ask an administrator to select one.")
     await prepare_ask_request(request, loaded_config)
-    if request.kind not in ("compare", "battle", "debate"):
-        await update_progress(request, "Working.")
     client_and_kwargs = build_openai_client_and_kwargs(loaded_config, provider_slash_model, messages_for_model(request.messages, provider_slash_model), stream=False)
     client = client_and_kwargs["client"]
     try:
@@ -858,14 +853,11 @@ def copy_for_retry(request: GenerationRequest, model: Optional[str] = None) -> G
 
 
 def response_footer(request: GenerationRequest) -> str:
-    models = request.model + (f" / {request.second_model}" if request.second_model else "")
+    models = " / ".join(model.removesuffix(":vision").split("/", 1)[-1] for model in (request.model, request.second_model) if model)
     if request.kind == "battle" and not request.revealed:
         models = "Blind battle · Vote to reveal"
     elapsed = request.elapsed_seconds if request.elapsed_seconds is not None else max(0, time.monotonic() - request.started_at)
-    return f"{models[:220]} · {elapsed:.1f}s"
-
-
-RESPONSE_DIVIDER = "────────────────────"
+    return f"{models[:220]} {elapsed:.1f}s"
 
 
 def followup_request(previous: GenerationRequest, instruction: str, loaded_config: dict[str, Any]) -> GenerationRequest:
@@ -892,14 +884,6 @@ def followup_request(previous: GenerationRequest, instruction: str, loaded_confi
     return request
 
 
-async def update_progress(request: Optional[GenerationRequest], text: str) -> None:
-    if request is not None and request.controls and request.controls.message:
-        try:
-            await request.controls.message.edit(content=text)
-        except discord.HTTPException:
-            logging.debug("Could not update progress message")
-
-
 class ResponseControls(View):
     def __init__(self, request: GenerationRequest):
         super().__init__(timeout=900)
@@ -907,7 +891,6 @@ class ResponseControls(View):
         self.message = None
 
     def finish(self) -> None:
-        self.download_response.disabled = not bool(self.request.output)
         if not self.request.completed or self.request.kind == "image":
             return
         if self.request.kind == "battle":
@@ -920,9 +903,8 @@ class ResponseControls(View):
                     self.request.revealed = True
                     reveal = f"**{choice}**\nA: `{self.request.model}`\nB: `{self.request.second_model}`"
                     for child in self.children:
-                        if child is not self.download_response:
-                            child.disabled = True
-                    content = self.request.answer_content + "\n\n" + RESPONSE_DIVIDER + "\n-# " + response_footer(self.request)
+                        child.disabled = True
+                    content = self.request.answer_content + "\n\n-# " + response_footer(self.request)
                     await interaction.response.edit_message(content=content, view=self, allowed_mentions=discord.AllowedMentions.none())
                     await interaction.followup.send(reveal, ephemeral=self.request.private, allowed_mentions=discord.AllowedMentions.none())
                 item.callback = vote
@@ -935,25 +917,6 @@ class ResponseControls(View):
             item.callback = steer
             self.add_item(item)
             return
-        for label, instruction in (
-            ("Go deeper", "Expand on your previous answer with more detail and concrete examples."),
-            ("Challenge this", "Critically examine the previous answer. Identify weak assumptions, counterarguments, and corrections."),
-        ):
-            item = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, row=0)
-            async def act(interaction, prompt=instruction):
-                config = await asyncio.to_thread(get_config)
-                request = followup_request(self.request, prompt, config)
-                await run_interaction_request(interaction, request, config)
-            item.callback = act
-            self.add_item(item)
-        item = discord.ui.Button(label="Change model", style=discord.ButtonStyle.secondary, row=1)
-        async def choose(interaction):
-            config = await asyncio.to_thread(get_config)
-            picker = ModelPicker(self.request, list(config["models"]))
-            await interaction.response.send_message("Choose a model to rerun this prompt.", view=picker, ephemeral=True)
-            picker.message = await interaction.original_response()
-        item.callback = choose
-        self.add_item(item)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.request.user_id or interaction.channel_id != self.request.channel_id:
@@ -963,15 +926,6 @@ class ResponseControls(View):
             await interaction.response.send_message("You no longer have permission to use the bot here.", ephemeral=True)
             return False
         return True
-
-    @button(label="Download", style=discord.ButtonStyle.secondary, disabled=True)
-    async def download_response(self, interaction: discord.Interaction, item: discord.ui.Button) -> None:
-        if not self.request.output:
-            await interaction.response.send_message("No text answer is available yet.", ephemeral=True)
-        elif len(self.request.output.encode("utf-8")) > interaction.filesize_limit:
-            await interaction.response.send_message("This answer exceeds Discord's file upload limit.", ephemeral=True)
-        else:
-            await interaction.response.send_message(file=answer_file(self.request.output), ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         logging.error("Response button failed", exc_info=(type(error), error, error.__traceback__))
@@ -995,7 +949,7 @@ async def with_response_controls(request: GenerationRequest, loaded_config: dict
     progress_message = None
     try:
         if controls:
-            controls.message = progress_message = await send("Working.", view=controls)
+            controls.message = progress_message = await send("Working...", view=controls)
         await operation()
         request.completed = True
     finally:
@@ -1008,11 +962,10 @@ async def with_response_controls(request: GenerationRequest, loaded_config: dict
                 if request.answer_embed:
                     embed = request.answer_embed.copy()
                     prior = embed.footer.text or ""
-                    embed.description = (embed.description or "") + "\n\n" + RESPONSE_DIVIDER
                     embed.set_footer(text=(prior + " · " if prior else "") + response_footer(request))
                     kwargs["embed"] = embed
                 elif request.answer_content is not None:
-                    kwargs["content"] = request.answer_content + "\n\n" + RESPONSE_DIVIDER + "\n-# " + response_footer(request)
+                    kwargs["content"] = request.answer_content + "\n\n-# " + response_footer(request)
                 await request.answer_message.edit(**kwargs)
                 if controls:
                     controls.message = request.answer_message
@@ -1185,7 +1138,6 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
     if request is not None and request.messages is not None:
         messages, user_warnings = deepcopy(request.messages), request.warnings.copy()
     else:
-        await update_progress(request, "Reading conversation and attachments…")
         messages, user_warnings = await build_reply_chain_messages(start_msg, loaded_config, accept_images=True)
         append_system_prompt(messages, loaded_config, getattr(start_msg.channel, "id", None), getattr(start_msg.channel, "parent_id", None))
         messages.reverse()
@@ -1244,7 +1196,6 @@ async def send_streaming_reply(start_msg: discord.Message, loaded_config: dict[s
         await start_msg.reply("\n".join(sorted(user_warnings))[:1900], allowed_mentions=discord.AllowedMentions.none())
     client_and_kwargs = build_openai_client_and_kwargs(loaded_config, provider_slash_model, messages, stream=True)
     openai_client, openai_kwargs = client_and_kwargs["client"], client_and_kwargs["kwargs"]
-    await update_progress(request, "Working.")
     try:
         async with start_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
@@ -1459,26 +1410,6 @@ async def ask_command(interaction: discord.Interaction, prompt: str, private: bo
 
 @discord.app_commands.allowed_installs(guilds=True, users=True)
 @discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@discord.app_commands.describe(prompt="Prompt to send to both models", model_a="First model", model_b="Second model", private="Only show the comparison to you")
-@discord_bot.tree.command(name="compare", description="Compare two models on the same prompt")
-async def compare_command(interaction: discord.Interaction, prompt: str, model_a: str, model_b: str, private: bool = False) -> None:
-    loaded_config = await asyncio.to_thread(get_config)
-    if not user_has_permission_for_interaction(interaction, loaded_config):
-        await interaction.response.send_message("You don't have permission to use this bot here.", ephemeral=True)
-        return
-    if model_a not in loaded_config["models"] or model_b not in loaded_config["models"] or model_a == model_b:
-        await interaction.response.send_message("Choose two different models from the configured model list.", ephemeral=True)
-        return
-    request = GenerationRequest(interaction.user.id, interaction.channel_id, "compare", model_a, prompt, private=private, second_model=model_b)
-    await run_interaction_request(interaction, request, loaded_config)
-
-
-compare_command.autocomplete("model_a")(model_autocomplete)
-compare_command.autocomplete("model_b")(model_autocomplete)
-
-
-@discord.app_commands.allowed_installs(guilds=True, users=True)
-@discord.app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @discord.app_commands.describe(prompt="Prompt for two randomly selected models", private="Only show this battle to you")
 @discord_bot.tree.command(name="battle", description="Vote on two anonymous answers, then reveal their models")
 async def battle_command(interaction: discord.Interaction, prompt: str, private: bool = False) -> None:
@@ -1514,7 +1445,7 @@ async def run_interaction_request(interaction: discord.Interaction, request: Gen
         return
     available = (loaded_config.get("image_models") or ["openrouter/auto"]) if request.kind == "image" else loaded_config["models"]
     if request.model not in available or (request.second_model and (request.second_model not in available or request.second_model == request.model)):
-        await interaction.response.send_message("Choose configured models; comparisons and debates need two different models.", ephemeral=True)
+        await interaction.response.send_message("Choose configured models; battles and debates need two different models.", ephemeral=True)
         return
     private = request.private or request.kind == "message"
     await interaction.response.defer(thinking=True, ephemeral=private)
@@ -1531,7 +1462,6 @@ async def run_interaction_request(interaction: discord.Interaction, request: Gen
             await send_streaming_reply(request.start_msg, loaded_config, log_label="Retry", request=request)
             await notify("Retried your request as a new reply to the original message.")
         elif request.kind == "image":
-            await update_progress(request, "Rendering.")
             image_bytes, media_type = await generate_openrouter_image(request.prompt, request.model, loaded_config)
             if len(image_bytes) > interaction.filesize_limit:
                 raise UserFacingError("The generated image exceeds Discord's upload limit. Try a smaller image or another model.")
@@ -1543,32 +1473,30 @@ async def run_interaction_request(interaction: discord.Interaction, request: Gen
                 file=discord.File(io.BytesIO(image_bytes), filename=f"generated-image.{extension}"),
                 ephemeral=private, allowed_mentions=discord.AllowedMentions.none(), wait=True,
             )
-        elif request.kind in ("compare", "battle"):
+        elif request.kind == "battle":
             await prepare_ask_request(request, loaded_config)
             sections = [f"**Prompt**\n{request.prompt}"]
             failed = False
             for index, model in enumerate((request.model, request.second_model), 1):
-                await update_progress(request, f"Head to head · {index}/2")
                 try:
                     answer = await generate_nonstream_response(request.prompt, request.user_id, loaded_config, model, request=request)
-                except Exception as error:
-                    logging.exception("Comparison model failed: %s", model)
+                except Exception:
+                    logging.exception("Battle model failed: %s", model)
                     failed = True
-                    answer = "This contender could not finish." if request.kind == "battle" else friendly_error(error)
-                label = ("Answer A" if index == 1 else "Answer B") if request.kind == "battle" else model
+                    answer = "This contender could not finish."
+                label = "Answer A" if index == 1 else "Answer B"
                 sections.append(f"## {label}\n\n{answer}")
                 request.output = "\n\n".join(sections)
             if request.warnings:
                 sections.append("\n".join(sorted(request.warnings)))
             await publish_answer(interaction, request, "\n\n".join(sections), loaded_config)
-            if failed and request.kind == "battle":
+            if failed:
                 raise UserFacingError("Battle incomplete. Use `/retry` for a fresh attempt; voting is unavailable.")
         elif request.kind == "debate":
             await prepare_ask_request(request, loaded_config)
             transcript = deepcopy(request.messages)
             sections = [f"**Round {request.round_number}**\n> {request.prompt}"]
             for index, model in enumerate((request.model, request.second_model), 1):
-                await update_progress(request, f"Head to head · {index}/2")
                 direction = ("Present or refine a defensible position on the topic." if index == 1 else "Challenge the first debater's argument and offer a reasoned alternative.")
                 turn = copy_for_retry(request, model)
                 turn.messages = transcript + [dict(role="user", content=f"You are debater {index}. {direction} Respond to the latest user direction. Keep this turn under 300 words and acknowledge valid points.")]
@@ -1636,7 +1564,7 @@ async def retry_command(interaction: discord.Interaction, model: Optional[str] =
         await interaction.response.send_message("That model is no longer configured. Select a model from `/retry model:`.", ephemeral=True)
         return
     if previous.second_model and (previous.second_model not in available or previous.second_model == selected_model):
-        await interaction.response.send_message("A comparison needs two different configured models. Start a new `/compare`.", ephemeral=True)
+        await interaction.response.send_message("Battles and debates need two different configured models. Start a new `/battle` or `/debate`.", ephemeral=True)
         return
     request = copy_for_retry(previous, selected_model)
     await run_interaction_request(interaction, request, loaded_config)
@@ -1728,7 +1656,7 @@ async def status_command(interaction: discord.Interaction) -> None:
         return
     image_models = loaded_config.get("image_models") or ["openrouter/auto"]
     image_model = curr_image_model if curr_image_model in image_models else image_models[0]
-    commands_text = "`/help`, `/ask` (attachment/private), `/compare`, `/battle`, `/debate`, `/image`, `/retry` (model), `/stop`, `/status`"
+    commands_text = "`/help`, `/ask` (attachment/private), `/battle`, `/debate`, `/image`, `/retry` (model), `/stop`, `/status`"
     if is_admin_user(interaction.user.id, loaded_config):
         commands_text += "\nAdmin: `/model`, `/imagemodel`, `/channelmodel`, `/channelprompt`"
     output = (
@@ -1756,14 +1684,12 @@ async def help_command(interaction: discord.Interaction) -> None:
         "In DMs, conversations continue automatically; mention me to start fresh.\n\n"
         "**Examples**\n"
         "• `/ask prompt:Explain this code private:true` — a private answer; optionally add `attachment:`.\n"
-        "• `/compare prompt:Explain recursion model_a:… model_b:…` — select two models from autocomplete.\n"
         "• `/battle prompt:Pitch a game idea` — vote on anonymous answers, then reveal the models.\n"
         "• `/debate topic:Should cities ban cars? model_a:… model_b:…` — steer each new round.\n"
         "• `/image prompt:A tiny astronaut tending a garden` — generate an image.\n\n"
         "**Controls**\n"
         "`/stop` cancels your generation. `/retry` repeats your latest request; `/retry model:…` changes its model. "
-        "Go deeper and Challenge this build on an answer. Change model reruns its prompt. "
-        "Download saves Markdown. Long answers can arrive as files.\n\n"
+        "Long answers can arrive as files.\n\n"
         "**Models and privacy**\n"
         "`/status` shows this channel's model and limits. Private answers, retries, and files stay private. "
         "Model overrides on retries don't change the channel default."
